@@ -1,0 +1,28 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Cachés de Python y Linters
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Archivos de entorno y secretos
+.env
+.env.local
+*.pem
+
+# Configuraciones locales de editores (como tu VSCode)
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Builds y distribuciones (por si empaquetas el proyecto luego)
+build/
+dist/
+*.egg-info/

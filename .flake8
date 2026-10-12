@@ -1,0 +1,12 @@
+[flake8]
+# Ignora estas carpetas por completo
+exclude =
+    .git,
+    __pycache__,
+    venv,
+    .venv,
+    .mypy_cache,
+    .pytest_cache
+
+# Aumenta el límite de caracteres por línea (88 es el estándar de Black)
+max-line-length = 88
