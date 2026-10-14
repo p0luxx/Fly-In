@@ -16,13 +16,12 @@ __pycache__/
 .env.local
 *.pem
 
-# Configuraciones locales de editores (como tu VSCode)
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# Builds y distribuciones (por si empaquetas el proyecto luego)
+
 build/
 dist/
 *.egg-info/
