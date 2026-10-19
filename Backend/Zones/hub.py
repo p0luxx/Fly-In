@@ -1,12 +1,13 @@
 from dataclasses import dataclass
-from zone_type import ZoneType
+from Backend.Zones.hub_type import HubType
 
 @dataclass
-class Zone:
+class Hub:
+    directive: str
     name: str
     x: int
     y: int
-    zone_type: ZoneType = ZoneType.NORMAL
+    zone: HubType = HubType.NORMAL
     max_drones: int = 1
     color: str = "white"
 

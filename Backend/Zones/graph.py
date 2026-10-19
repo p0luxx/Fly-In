@@ -1,10 +1,10 @@
-from conection import Connection
-from zone import Zone
+from Backend.Zones.conection import Connection
+from Backend.Zones.hub import Hub
 
 class Graph:
     def __init__(self) -> None:
-        self.start: Zone = None
-        self.end: Zone = None
+        self.start: Hub | None = None
+        self.end: Hub | None = None
         self.n_drones: int = 0
         self.link_dict: dict = {}
         self.nodes_dict: dict = {}
@@ -17,7 +17,7 @@ class Graph:
         for item in self.nodes_dict.items():
             print(item)
 
-    def add_node(self, node: Zone) -> None:
+    def add_node(self, node: Hub) -> None:
         self.nodes_dict[node.name] = node
 
     def add_link(self, link: Connection) -> None:

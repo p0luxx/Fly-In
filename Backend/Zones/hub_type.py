@@ -1,6 +1,6 @@
 from enum import Enum
 
-class ZoneType(Enum):
+class HubType(Enum):
     NORMAL = "normal"
     PRIORITY = "priority"
     RESTRICTED = "restricted"
