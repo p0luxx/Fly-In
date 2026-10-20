@@ -8,6 +8,7 @@ class Graph:
         self.n_drones: int = 0
         self.link_dict: dict = {}
         self.nodes_dict: dict = {}
+        self.adj: dict[str, list[Connection]] = {}
 
     def test(self):
         print("Link dict:")
@@ -18,19 +19,28 @@ class Graph:
             print(item)
 
     def add_node(self, node: Hub) -> None:
+        if node.directive == "start_hub":
+            self.start = node
+        elif node.directive == "end_hub":
+            self.end = node
         self.nodes_dict[node.name] = node
+        self.adj[node.name] = []
 
     def add_link(self, link: Connection) -> None:
-        self.link_dict[link.id] = link
+        if link.from_zone in self.nodes_dict and link.to_zone in self.nodes_dict:
+            if link.from_zone != link.to_zone:
+                self.link_dict[link.id] = link
+                self.adj[link.from_zone].append(link)
+                self.adj[link.to_zone].append(link)
+            else:
+                raise ValueError("Attention: A node connected to itself in a bidirectional" 
+                                 "manner has been detected."
+                                 "\nClosing Fly-in...")
+        else:
+            raise ValueError("Attention: An orphaned node has been detected.\nClosing Fly-in...")
 
-    def get_neighbors(self, zone_name: str) -> list[str]:
-        neighbors: list[str] = []
-        for value in self.link_dict.values():
-            if value.from_zone == zone_name:
-                neighbors.append(value.to_zone)
-            elif value.to_zone == zone_name:
-                neighbors.append(value.from_zone)
-        return neighbors
+    def get_neighbors(self, zone_name: str) -> list[Connection]:
+        return self.adj.get(zone_name, [])
 
 """
 if __name__ == "__main__":
