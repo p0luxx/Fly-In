@@ -4,5 +4,6 @@ from Backend.Zones.graph import Graph
 from Backend.Zones.hub_type import HubType
 from Backend.Parser.map_parser import MapParser
 from Backend.Parser.parser_error_class import ParsingError
+from Backend.Solver import solver
 
-__all__ = ["Hub", "Connection", "Graph", "HubType", "MapParser", "ParsingError"]
+__all__ = ["Hub", "Connection", "Graph", "HubType", "MapParser", "ParsingError", "solver"]
