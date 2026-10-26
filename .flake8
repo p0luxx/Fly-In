@@ -1,5 +1,5 @@
 [flake8]
-# Ignora estas carpetas por completo
+# Exclude environments and generated caches.
 exclude =
     .git,
     __pycache__,
@@ -8,5 +8,5 @@ exclude =
     .mypy_cache,
     .pytest_cache
 
-# Aumenta el límite de caracteres por línea (88 es el estándar de Black)
+# Match the project's configured formatter line length.
 max-line-length = 88
