@@ -20,6 +20,8 @@ class Graph:
             print(item)
 
     def add_node(self, node: Hub) -> None:
+        if node.name in self.nodes_dict:
+            raise ValueError(f"The node '{node.name}' is duplicated in the map.")
         if node.directive == "start_hub":
             self.start = node
         elif node.directive == "end_hub":

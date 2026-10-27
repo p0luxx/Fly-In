@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 from Backend.Zones.conection import Connection
 from Backend.Zones.hub import Hub
 from Backend.Zones.hub_type import HubType
+import sys
 
 
 class MapParser(BaseModel):
@@ -75,7 +76,9 @@ class MapParser(BaseModel):
         if len(coordinates) != 3:
             raise ValueError("A hub must define a name and x/y coordinates.")
         name, x_str, y_str = coordinates
-
+        if "-" in name:
+            print(f"The node name cannot contain hyphens: '{name}'")
+            sys.exit()
         extras: dict[str, Any] = {}
         if len(parts) > 1:
             extra_raw = parts[1].strip()
@@ -94,16 +97,20 @@ class MapParser(BaseModel):
                     raise ValueError(
                         "Invalid hub zone type; use a supported HubType."
                     ) from error
-
-        self.hubs.append(
-            Hub(
-                directive=directive,
-                name=name,
-                x=int(x_str),
-                y=int(y_str),
-                **extras,
+        try:
+            self.hubs.append(
+                Hub(
+                    directive=directive,
+                    name=name,
+                    x=int(x_str),
+                    y=int(y_str),
+                    **extras,
+                )
             )
-        )
+        except TypeError as e:
+            raise TypeError(
+                "Unknown parameter within [...]"
+            ) from e
 
     def _connection_processor(self, value: str) -> None:
         parts = value.strip().split("[", 1)

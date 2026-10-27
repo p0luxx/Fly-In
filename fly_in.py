@@ -1,4 +1,4 @@
-#!/bin/usr/python3
+#!/usr/bin/env python3
 """Command-line entry point for the Fly-In application."""
 from __future__ import annotations
 
@@ -35,3 +35,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nThe program has been interrupted.", file=sys.stderr)
         sys.exit(130)
+    except TypeError as e:
+        print(e)

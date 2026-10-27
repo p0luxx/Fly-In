@@ -1,0 +1,2529 @@
+==> fly_in.py <==
+#!/bin/usr/python3
+"""Command-line entry point for the Fly-In application."""
+from __future__ import annotations
+
+import argparse
+import sys
+from collections.abc import Sequence
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Plan routes for multiple drones and optionally visualize them."
+    )
+    parser.add_argument("map_file", help="Path to the map file.")
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="Run route planning without opening the Pygame visualizer.",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        from Backend.orchestrator import Orchestrator
+
+        Orchestrator().run(args.map_file, use_gui=not args.no_gui)
+    except (ValueError, FileNotFoundError, PermissionError, RuntimeError) as error:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nThe program has been interrupted.", file=sys.stderr)
+        sys.exit(130)
+
+==> Makefile <==
+# Variables de entorno para facilitar la lectura y el mantenimiento
+PYTHON := python3
+VENV := venv
+VENV_BIN := $(VENV)/bin
+
+# .PHONY indica que estas reglas no son archivos físicos, sino comandos a ejecutar
+.PHONY: all install lint clean
+
+# Regla por defecto si solo ejecutas 'make'
+all: install
+
+# Regla para crear el entorno virtual y actualizar pip
+$(VENV):
+	$(PYTHON) -m venv $(VENV)
+	$(VENV_BIN)/python -m pip install --upgrade pip
+
+# Regla 'install': Depende de que $(VENV) exista. Instala las librerías.
+install: $(VENV)
+	$(VENV_BIN)/pip install pydantic flake8 mypy pygame pytest
+
+# Regla 'lint': Valida el código usando los ejecutables dentro del entorno virtual
+lint:
+	@echo "Ejecutando Flake8 (Estilo)..."
+	$(VENV_BIN)/flake8 .
+	@echo "Ejecutando MyPy (Tipado Estático)..."
+	$(VENV_BIN)/mypy .
+
+# Regla 'clean': Elimina el entorno virtual y los archivos temporales de caché
+clean:
+	rm -rf $(VENV)
+	rm -rf .mypy_cache
+	rm -rf .pytest_cache
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+	find . -type f -name "*.pyc" -delete
+==> mypy.ini <==
+[mypy]
+python_version = 3.10
+explicit_package_bases = True
+mypy_path = .
+exclude = (^|/)(venv|\.venv|\.mypy_cache|\.pytest_cache)/
+ignore_missing_imports = True
+warn_unused_ignores = True
+==> .flake8 <==
+[flake8]
+# Exclude environments and generated caches.
+exclude =
+    .git,
+    __pycache__,
+    venv,
+    .venv,
+    .mypy_cache,
+    .pytest_cache
+
+# Match the project's configured formatter line length.
+max-line-length = 88
+==> Backend/Drones/drone.py <==
+from collections.abc import Generator
+
+from Backend.Zones.conection import Connection
+
+
+class Drone:
+    def __init__(self, id: str, path: list[Connection]) -> None:
+        self.id = id
+        self.path = path
+        self.steps: Generator[Connection, None, None] = self._next_step()
+        self.c_pos: Connection | None = None
+
+    def _next_step(self) -> Generator[Connection, None, None]:
+        for step in self.path:
+            self.c_pos = step
+            yield step
+
+==> Backend/Parser/map_parser.py <==
+"""Load and validate map files for the Fly-In application."""
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel, Field, model_validator
+
+from Backend.Zones.conection import Connection
+from Backend.Zones.hub import Hub
+from Backend.Zones.hub_type import HubType
+
+
+class MapParser(BaseModel):
+    file_name: str
+    content: list[str] = Field(default_factory=list, exclude=True)
+    nb_drones: int = 0
+    hubs: list[Hub] = Field(default_factory=list)
+    connections: list[Connection] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def process_file_automatically(self) -> MapParser:
+        self._read_file()
+        self._parse_and_route()
+        start_count = sum(hub.directive == "start_hub" for hub in self.hubs)
+        end_count = sum(hub.directive == "end_hub" for hub in self.hubs)
+        if start_count != 1 or end_count != 1:
+            raise ValueError(
+                "The map must contain exactly one start_hub and one end_hub."
+            )
+        return self
+
+    def _read_file(self) -> None:
+        try:
+            with open(self.file_name, "r", encoding="utf-8") as map_file:
+                raw_lines = map_file.readlines()
+        except PermissionError as error:
+            raise PermissionError(
+                f"Permission denied while reading map file: {self.file_name}"
+            ) from error
+        except FileNotFoundError as error:
+            raise FileNotFoundError(
+                f"Map file not found: {self.file_name}"
+            ) from error
+
+        self.content = [
+            line.strip()
+            for line in raw_lines
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+    def _parse_and_route(self) -> None:
+        try:
+            for line in self.content:
+                if ":" not in line:
+                    raise ValueError("Invalid map syntax: missing ':' separator.")
+                key, value = (part.strip() for part in line.split(":", 1))
+                match key:
+                    case "nb_drones":
+                        self._drone_processing(value)
+                    case "start_hub" | "hub" | "end_hub":
+                        self._hub_processor(key, value)
+                    case "connection":
+                        self._connection_processor(value)
+                    case _:
+                        raise ValueError(f"Unknown map directive: {key}")
+        except ValueError as error:
+            raise ValueError(f"Invalid map: {error}") from error
+
+    def _drone_processing(self, value: str) -> None:
+        self.nb_drones = int(value)
+
+    def _hub_processor(self, directive: str, value: str) -> None:
+        parts = value.split("[", 1)
+        coordinates = parts[0].split()
+        if len(coordinates) != 3:
+            raise ValueError("A hub must define a name and x/y coordinates.")
+        name, x_str, y_str = coordinates
+
+        extras: dict[str, Any] = {}
+        if len(parts) > 1:
+            extra_raw = parts[1].strip()
+            if not extra_raw.endswith("]"):
+                raise ValueError("Invalid hub syntax: missing closing ']'.")
+            for item in extra_raw[:-1].split():
+                key, value_part = item.split("=", 1)
+                try:
+                    if value_part.lstrip("-").isnumeric():
+                        extras[key] = int(value_part)
+                    elif key == "zone":
+                        extras[key] = HubType[value_part.upper()]
+                    else:
+                        extras[key] = value_part
+                except KeyError as error:
+                    raise ValueError(
+                        "Invalid hub zone type; use a supported HubType."
+                    ) from error
+
+        self.hubs.append(
+            Hub(
+                directive=directive,
+                name=name,
+                x=int(x_str),
+                y=int(y_str),
+                **extras,
+            )
+        )
+
+    def _connection_processor(self, value: str) -> None:
+        parts = value.strip().split("[", 1)
+        route_str = parts[0].strip()
+        if "-" not in route_str:
+            raise ValueError(
+                f"Invalid connection syntax (missing '-'): '{route_str}'"
+            )
+
+        from_zone, to_zone = (part.strip() for part in route_str.split("-", 1))
+        if not from_zone or not to_zone:
+            raise ValueError(f"Connection endpoints cannot be empty: '{route_str}'")
+
+        capacity = 1
+        if len(parts) > 1:
+            extra_raw = parts[1].strip()
+            if not extra_raw.endswith("]"):
+                raise ValueError("Invalid connection syntax: missing closing ']'.")
+            for item in extra_raw[:-1].split():
+                if "=" not in item:
+                    continue
+                key, raw_value = item.split("=", 1)
+                if key == "max_link_capacity":
+                    if not raw_value.isdigit() or int(raw_value) <= 0:
+                        raise ValueError(
+                            "max_link_capacity must be a positive integer."
+                        )
+                    capacity = int(raw_value)
+
+        self.connections.append(
+            Connection(
+                from_zone=from_zone,
+                to_zone=to_zone,
+                max_link_capacity=capacity,
+            )
+        )
+
+==> Backend/Solver/models.py <==
+"""Data structures used by the drone route planner."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from Backend.Zones.conection import Connection
+
+
+@dataclass(frozen=True)
+class ScheduledStep:
+    """A drone action scheduled for a specific simulation turn."""
+
+    turn: int
+    from_zone: str
+    to_zone: str
+    connection: Connection
+    is_wait: bool = False
+    is_restricted_transit: bool = False
+
+
+@dataclass(order=True)
+class _SearchNode:
+    """A* search node in space-time."""
+
+    f_score: tuple[int, int, int, int, str]
+    g_turn: int = field(compare=False)
+    current_zone: str = field(compare=False)
+    departure_turn: int | None = field(compare=False)
+    priority_count: int = field(compare=False)
+    hops: int = field(compare=False)
+    steps: tuple[ScheduledStep, ...] = field(compare=False, default_factory=tuple)
+
+==> Backend/Solver/pathfinding.py <==
+"""Graph validation, capacity reservations, and space-time route search."""
+from __future__ import annotations
+
+import heapq
+
+from Backend.Solver.models import ScheduledStep, _SearchNode
+from Backend.Zones.conection import Connection
+from Backend.Zones.hub import Hub
+from Backend.Zones.hub_type import HubType
+from Backend.Zones.graph import Graph
+
+__all__ = ["_Pathfinding"]
+
+
+class _Pathfinding:
+    """Route-search behavior mixed into the public solver."""
+
+    graph: Graph
+    heuristics: dict[str, int]
+    hub_reservations: dict[str, dict[int, int]]
+    link_reservations: dict[str, dict[int, int]]
+    max_turns_limit: int
+
+    def _validate_graph(self) -> tuple[Hub, Hub]:
+        if self.graph.start is None or self.graph.end is None:
+            raise ValueError(
+                "The graph must define both a 'start_hub' and an 'end_hub'."
+            )
+        if self.graph.n_drones < 0:
+            raise ValueError("The number of drones cannot be negative.")
+        if (
+            self.graph.start.zone == HubType.BLOCKED
+            or self.graph.end.zone == HubType.BLOCKED
+        ):
+            raise ValueError("The start or end hub is blocked (BLOCKED).")
+        return self.graph.start, self.graph.end
+
+    @staticmethod
+    def _canonical_link_id(link: Connection) -> str:
+        """Return a direction-independent identifier for a connection."""
+        a, b = sorted((link.from_zone, link.to_zone))
+        return f"{a}<->{b}"
+
+    @staticmethod
+    def _orient_connection(
+        link: Connection, from_zone: str, to_zone: str
+    ) -> Connection:
+        """Orient a connection in the direction of travel."""
+        if link.from_zone == from_zone and link.to_zone == to_zone:
+            return link
+        return Connection(
+            from_zone=from_zone,
+            to_zone=to_zone,
+            max_link_capacity=link.max_link_capacity,
+        )
+
+    def _compute_backward_heuristics(self) -> None:
+        """Compute the admissible minimum-turn distance to the end hub."""
+        start_hub, end_hub = self._validate_graph()
+        dist: dict[str, int] = {end_hub.name: 0}
+        pq: list[tuple[int, str]] = [(0, end_hub.name)]
+
+        while pq:
+            current_cost, current_name = heapq.heappop(pq)
+            if current_cost > dist.get(current_name, float("inf")):
+                continue
+
+            current_hub = self.graph.nodes_dict[current_name]
+            step_cost = 2 if current_hub.zone == HubType.RESTRICTED else 1
+
+            for link in self.graph.get_neighbors(current_name):
+                if link.max_link_capacity <= 0:
+                    continue
+                neighbor_name = link.get_destination(current_name)
+                neighbor_hub = self.graph.nodes_dict.get(neighbor_name)
+                if neighbor_hub is None or neighbor_hub.zone == HubType.BLOCKED:
+                    continue
+                if neighbor_name != start_hub.name and neighbor_hub.max_drones <= 0:
+                    continue
+
+                new_cost = current_cost + step_cost
+                if new_cost < dist.get(neighbor_name, float("inf")):
+                    dist[neighbor_name] = new_cost
+                    heapq.heappush(pq, (new_cost, neighbor_name))
+
+        self.heuristics = dist
+        if start_hub.name not in self.heuristics:
+            raise ValueError(
+                f"No valid route exists between '{start_hub.name}' "
+                f"and '{end_hub.name}'."
+            )
+
+    def _can_occupy_hub(self, hub_name: str, turn: int) -> bool:
+        """Check whether a hub has capacity available on the given turn."""
+        start_hub, end_hub = self._validate_graph()
+        if hub_name in (start_hub.name, end_hub.name):
+            return True
+        hub = self.graph.nodes_dict[hub_name]
+        return self.hub_reservations[hub_name][turn] < hub.max_drones
+
+    def _can_use_link(self, link: Connection, turn: int) -> bool:
+        """Check whether a connection has capacity available on the given turn."""
+        canon_id = self._canonical_link_id(link)
+        return self.link_reservations[canon_id][turn] < link.max_link_capacity
+
+    def _reserve_trajectory(self, steps: tuple[ScheduledStep, ...]) -> None:
+        """Record the hubs and connections used by a drone."""
+        start_hub, end_hub = self._validate_graph()
+        for step in steps:
+            if not step.is_wait:
+                canon_id = self._canonical_link_id(step.connection)
+                self.link_reservations[canon_id][step.turn] += 1
+            if not step.is_restricted_transit:
+                if step.to_zone not in (start_hub.name, end_hub.name):
+                    self.hub_reservations[step.to_zone][step.turn] += 1
+
+    def _find_optimal_trajectory_for_drone(self) -> tuple[ScheduledStep, ...]:
+        """Find a collision-free route while respecting earlier reservations."""
+        start_hub, end_hub = self._validate_graph()
+        start_h = self.heuristics[start_hub.name]
+
+        initial_node = _SearchNode(
+            f_score=(start_h, 0, 0, 0, start_hub.name),
+            g_turn=0,
+            current_zone=start_hub.name,
+            departure_turn=None,
+            priority_count=0,
+            hops=0,
+            steps=(),
+        )
+
+        open_heap: list[_SearchNode] = [initial_node]
+        # Keep the best (-priority_count, active_time, hops) for each zone and turn.
+        best_seen: dict[tuple[str, int], tuple[int, int, int]] = {}
+
+        while open_heap:
+            node = heapq.heappop(open_heap)
+            u = node.current_zone
+            t = node.g_turn
+
+            if u == end_hub.name:
+                return node.steps
+
+            if t >= self.max_turns_limit:
+                continue
+
+            active_time = (
+                0 if node.departure_turn is None else t - node.departure_turn
+            )
+            state_key = (u, t)
+            state_quality = (-node.priority_count, active_time, node.hops)
+            if state_key in best_seen and best_seen[state_key] <= state_quality:
+                continue
+            best_seen[state_key] = state_quality
+
+            # 1. Explore moves along neighboring connections.
+            for link in self.graph.get_neighbors(u):
+                if link.max_link_capacity <= 0:
+                    continue
+                v = link.get_destination(u)
+                if v not in self.heuristics:
+                    continue
+
+                v_hub = self.graph.nodes_dict[v]
+                move_cost = 2 if v_hub.zone == HubType.RESTRICTED else 1
+                arrival_turn = t + move_cost
+
+                if move_cost == 1:
+                    if not self._can_use_link(link, t + 1):
+                        continue
+                    if not self._can_occupy_hub(v, t + 1):
+                        continue
+                    oriented = self._orient_connection(link, u, v)
+                    new_steps = node.steps + (
+                        ScheduledStep(
+                            turn=t + 1,
+                            from_zone=u,
+                            to_zone=v,
+                            connection=oriented,
+                        ),
+                    )
+                else:
+                    # Restricted transit uses t+1 and reaches the hub on t+2.
+                    if not (
+                        self._can_use_link(link, t + 1)
+                        and self._can_use_link(link, t + 2)
+                    ):
+                        continue
+                    if not self._can_occupy_hub(v, t + 2):
+                        continue
+                    oriented = self._orient_connection(link, u, v)
+                    new_steps = node.steps + (
+                        ScheduledStep(
+                            turn=t + 1,
+                            from_zone=u,
+                            to_zone=v,
+                            connection=oriented,
+                            is_restricted_transit=True,
+                        ),
+                        ScheduledStep(
+                            turn=t + 2,
+                            from_zone=u,
+                            to_zone=v,
+                            connection=oriented,
+                        ),
+                    )
+
+                new_departure = (
+                    t if node.departure_turn is None else node.departure_turn
+                )
+                new_priority = node.priority_count + (
+                    1 if v_hub.zone == HubType.PRIORITY else 0
+                )
+                new_hops = node.hops + 1
+                est_arrival = arrival_turn + self.heuristics[v]
+                est_active = est_arrival - new_departure
+
+                next_node = _SearchNode(
+                    f_score=(est_arrival, -new_priority, est_active, new_hops, v),
+                    g_turn=arrival_turn,
+                    current_zone=v,
+                    departure_turn=new_departure,
+                    priority_count=new_priority,
+                    hops=new_hops,
+                    steps=new_steps,
+                )
+                heapq.heappush(open_heap, next_node)
+
+            # 2. Explore waiting for one turn at the current hub.
+            if self._can_occupy_hub(u, t + 1):
+                wait_conn = Connection(from_zone=u, to_zone=u, max_link_capacity=0)
+                new_steps = node.steps + (
+                    ScheduledStep(
+                        turn=t + 1,
+                        from_zone=u,
+                        to_zone=u,
+                        connection=wait_conn,
+                        is_wait=True,
+                    ),
+                )
+                if node.departure_turn is None and u == start_hub.name:
+                    dep = None
+                    est_active = self.heuristics[u]
+                else:
+                    dep = 0 if node.departure_turn is None else node.departure_turn
+                    est_active = (t + 1) + self.heuristics[u] - dep
+
+                est_arrival = (t + 1) + self.heuristics[u]
+                wait_node = _SearchNode(
+                    f_score=(
+                        est_arrival,
+                        -node.priority_count,
+                        est_active,
+                        node.hops,
+                        u,
+                    ),
+                    g_turn=t + 1,
+                    current_zone=u,
+                    departure_turn=dep,
+                    priority_count=node.priority_count,
+                    hops=node.hops,
+                    steps=new_steps,
+                )
+                heapq.heappush(open_heap, wait_node)
+
+        raise RuntimeError(
+            "Could not find a collision-free route within the turn limit."
+        )
+
+==> Backend/Solver/solution_output.py <==
+"""Formatting of solver schedules for command-line and textual output."""
+from __future__ import annotations
+
+from collections import defaultdict
+
+from Backend.Drones.drone import Drone
+from Backend.Zones.graph import Graph
+
+__all__ = ["_SolutionOutput"]
+
+
+class _SolutionOutput:
+    """Schedule formatting behavior mixed into the public solver."""
+
+    schedules: dict
+    graph: Graph
+    total_turns: int
+
+    def solve(
+        self,
+        include_waits_in_path: bool = False,
+        drone_prefix: str = "D",
+    ) -> list[Drone]:
+        raise NotImplementedError
+
+    def get_turns_output(self) -> list[str]:
+        """
+        Generate the standard turn-by-turn Fly-In output:
+        - Normal or priority move: `D1-destination`
+        - Restricted transit (first turn): `D1-origin-destination`
+        - Restricted arrival (second turn): `D1-destination`
+        """
+        if not self.schedules and self.graph.n_drones > 0:
+            self.solve()
+
+        turns_dict: dict[int, list[str]] = defaultdict(list)
+        for drone_id, steps in self.schedules.items():
+            for step in steps:
+                if step.is_wait:
+                    continue
+                if step.is_restricted_transit:
+                    turns_dict[step.turn].append(
+                        f"{drone_id}-{step.from_zone}-{step.to_zone}"
+                    )
+                else:
+                    turns_dict[step.turn].append(f"{drone_id}-{step.to_zone}")
+
+        return [
+            " ".join(turns_dict[t])
+            for t in range(1, self.total_turns + 1)
+            if turns_dict[t]
+        ]
+
+    def format_solution(self, show_turn_prefix: bool = False) -> str:
+        """Return the complete turn-by-turn simulation as a string."""
+        lines = self.get_turns_output()
+        if show_turn_prefix:
+            return "\n".join(
+                f"Turn {idx}: {line}" for idx, line in enumerate(lines, start=1)
+            )
+        return "\n".join(lines)
+
+==> Backend/Solver/solver.py <==
+"""Public solver API for planning collision-free drone routes."""
+from __future__ import annotations
+
+from collections import defaultdict
+
+from Backend.Drones.drone import Drone
+from Backend.Solver.models import ScheduledStep
+from Backend.Solver.pathfinding import _Pathfinding
+from Backend.Solver.solution_output import _SolutionOutput
+from Backend.Zones.conection import Connection
+from Backend.Zones.graph import Graph
+from Backend.Zones.hub import Hub
+from Backend.Zones.hub_type import HubType
+
+__all__ = [
+    "Connection",
+    "Drone",
+    "Graph",
+    "Hub",
+    "HubType",
+    "ScheduledStep",
+    "Solver",
+]
+
+
+class Solver(_Pathfinding, _SolutionOutput):
+    """
+    Plan optimal routes for multiple drones on a Fly-In graph.
+
+    Combines reverse Dijkstra heuristics with space-time A* and capacity
+    reservations for hubs and connections.
+    """
+
+    def __init__(self, graph: Graph, max_turns_limit: int = 5000) -> None:
+        self.graph: Graph = graph
+        self.max_turns_limit: int = max_turns_limit
+        self.heuristics: dict[str, int] = {}
+        self.drones: list[Drone] = []
+        self.schedules: dict[str, list[ScheduledStep]] = {}
+        self.hub_reservations: dict[str, dict[int, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+        self.link_reservations: dict[str, dict[int, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+        self.total_turns: int = 0
+
+    def solve(
+        self,
+        include_waits_in_path: bool = False,
+        drone_prefix: str = "D",
+    ) -> list[Drone]:
+        """
+        Find an optimal path for each drone and return the created drones.
+
+        Args:
+            include_waits_in_path: Include wait steps and restricted-transit
+                steps in each drone's path. When false, paths contain only
+                completed connections from start to end.
+            drone_prefix: Prefix for drone IDs, such as ``"D"`` for ``"D1"``.
+        """
+        self._validate_graph()
+        self.drones.clear()
+        self.schedules.clear()
+        self.hub_reservations.clear()
+        self.link_reservations.clear()
+        self.total_turns = 0
+
+        if self.graph.n_drones == 0:
+            return []
+
+        self._compute_backward_heuristics()
+
+        for i in range(1, self.graph.n_drones + 1):
+            drone_id = f"{drone_prefix}{i}"
+            trajectory = self._find_optimal_trajectory_for_drone()
+            self._reserve_trajectory(trajectory)
+            self.schedules[drone_id] = list(trajectory)
+
+            if trajectory:
+                self.total_turns = max(self.total_turns, trajectory[-1].turn)
+
+            if include_waits_in_path:
+                drone_path = [step.connection for step in trajectory]
+            else:
+                drone_path = [
+                    step.connection
+                    for step in trajectory
+                    if not step.is_wait and not step.is_restricted_transit
+                ]
+
+            self.drones.append(Drone(id=drone_id, path=drone_path))
+
+        return self.drones
+
+==> Backend/Zones/conection.py <==
+from dataclasses import dataclass
+
+
+@dataclass
+class Connection:
+    from_zone: str = ""
+    to_zone: str = ""
+    max_link_capacity: int = 1
+
+    @property
+    def id(self) -> str:
+        return f"{self.from_zone}-{self.to_zone}"
+
+    def get_destination(self, current_zone: str) -> str:
+        if current_zone == self.from_zone:
+            return self.to_zone
+        if current_zone == self.to_zone:
+            return self.from_zone
+        raise ValueError(
+            f"Zone: {current_zone} is not part of connection {self.id}"
+        )
+
+==> Backend/Zones/graph.py <==
+from Backend.Zones.conection import Connection
+from Backend.Zones.hub import Hub
+
+
+class Graph:
+    def __init__(self) -> None:
+        self.start: Hub | None = None
+        self.end: Hub | None = None
+        self.n_drones: int = 0
+        self.link_dict: dict[str, Connection] = {}
+        self.nodes_dict: dict[str, Hub] = {}
+        self.adj: dict[str, list[Connection]] = {}
+
+    def test(self):
+        print("Link dict:")
+        for item in self.link_dict.items():
+            print(item)
+        print("Nodes dict")
+        for item in self.nodes_dict.items():
+            print(item)
+
+    def add_node(self, node: Hub) -> None:
+        if node.directive == "start_hub":
+            self.start = node
+        elif node.directive == "end_hub":
+            self.end = node
+        self.nodes_dict[node.name] = node
+        self.adj[node.name] = []
+
+    def add_link(self, link: Connection) -> None:
+        if link.from_zone in self.nodes_dict and link.to_zone in self.nodes_dict:
+            if link.from_zone != link.to_zone:
+                self.link_dict[link.id] = link
+                self.adj[link.from_zone].append(link)
+                self.adj[link.to_zone].append(link)
+            else:
+                raise ValueError(
+                    "A node connected to itself in a bidirectional manner "
+                    "has been detected.\nClosing Fly-In..."
+                )
+        else:
+            raise ValueError(
+                "An orphaned node has been detected.\nClosing Fly-In..."
+            )
+
+    def get_neighbors(self, zone_name: str) -> list[Connection]:
+        return self.adj.get(zone_name, [])
+
+==> Backend/Zones/hub.py <==
+from dataclasses import dataclass
+
+from Backend.Zones.hub_type import HubType
+
+
+@dataclass
+class Hub:
+    directive: str
+    name: str
+    x: int
+    y: int
+    zone: HubType = HubType.NORMAL
+    max_drones: int = 1
+    color: str = "white"
+
+==> Backend/Zones/hub_type.py <==
+from enum import Enum
+
+
+class HubType(Enum):
+    NORMAL = "normal"
+    PRIORITY = "priority"
+    RESTRICTED = "restricted"
+    BLOCKED = "blocked"
+
+==> Frontend/visualizer_context.py <==
+"""Typed shared state for the visualizer's runtime and rendering layers."""
+from __future__ import annotations
+
+from collections import deque
+from typing import ClassVar
+
+import pygame
+
+from Backend.Solver.models import ScheduledStep
+from Backend.Solver.solver import Solver
+from Backend.Zones.graph import Graph
+from Frontend.visualizer_support import (
+    DroneRenderState,
+    GlowCache,
+    OrganicLabelEngine,
+    Shockwave,
+    SmoothCamera2D,
+)
+
+
+class _VisualizerContext:
+    """State and operations shared by the visualizer's focused mixins."""
+
+    BG_TOP: ClassVar[tuple[int, int, int]]
+    BG_BOTTOM: ClassVar[tuple[int, int, int]]
+    PANEL_BG: ClassVar[tuple[int, int, int, int]]
+    PANEL_BORDER: ClassVar[tuple[int, int, int, int]]
+    TEXT_BRIGHT: ClassVar[tuple[int, int, int]]
+    TEXT_SOFT: ClassVar[tuple[int, int, int]]
+    TEXT_ACCENT: ClassVar[tuple[int, int, int]]
+
+    graph: Graph
+    solver: Solver
+    width: int
+    height: int
+    sim_time: float
+    playing: bool
+    turns_per_sec: float
+    show_node_names: bool
+    drone_label_mode: int
+    selected_hub: str | None
+    selected_drone: str | None
+    hovered_hub: str | None
+    hovered_drone: str | None
+    step_map: dict[str, dict[int, ScheduledStep]]
+    arrival_turns: dict[str, int]
+    departure_turns: dict[str, int]
+    drone_colors: dict[str, tuple[int, int, int]]
+    trails: dict[str, deque[tuple[float, float]]]
+    shockwaves: list[Shockwave]
+    _triggered_arrivals: set[str]
+    glow: GlowCache
+    camera: SmoothCamera2D
+    label_engine: OrganicLabelEngine
+    _node_text_cache: dict[str, pygame.Surface]
+    _drone_text_cache: dict[str, pygame.Surface]
+    _bg_surface: pygame.Surface | None
+    stars: list[tuple[float, float, float, float, float]]
+
+    def _init_simulation_structures(self) -> None: ...
+
+    def _drone_zone_at_turn(self, drone_id: str, turn_idx: int) -> str:
+        raise NotImplementedError
+
+    def _compute_drone_kinematics(
+        self, drone_id: str, sim_t: float
+    ) -> tuple[float, float, float, str, str, bool, bool]:
+        raise NotImplementedError
+
+    def _compute_all_drones_render_state(
+        self, elapsed: float
+    ) -> tuple[list[DroneRenderState], dict[str, list[str]]]:
+        raise NotImplementedError
+
+==> Frontend/visualizer.py <==
+"""Main simulation state and public entry point for the Fly-In frontend."""
+from __future__ import annotations
+
+import math
+import random
+from collections import deque
+
+import pygame
+
+from Backend.Solver.solver import ScheduledStep, Solver
+from Backend.Zones.graph import Graph
+from Frontend.visualizer_runtime import _PygameRuntime
+from Frontend.visualizer_support import (
+    DREAM_PALETTE,
+    DroneRenderState,
+    GlowCache,
+    OrganicLabelEngine,
+    Shockwave,
+    SmoothCamera2D,
+    SmoothLabelState,
+    clamp,
+    ease_in_out_sine,
+    exp_decay,
+    golden_angle_drone_color,
+    resolve_color,
+    smoothstep,
+)
+
+__all__ = [
+    "DREAM_PALETTE",
+    "DroneRenderState",
+    "FlyInVisualizer",
+    "GlowCache",
+    "OrganicLabelEngine",
+    "Shockwave",
+    "SmoothCamera2D",
+    "SmoothLabelState",
+    "clamp",
+    "ease_in_out_sine",
+    "exp_decay",
+    "golden_angle_drone_color",
+    "resolve_color",
+    "smoothstep",
+]
+
+
+class FlyInVisualizer(_PygameRuntime):
+    """Simulation state and orchestration for the interactive visualizer."""
+
+    BG_TOP = (8, 10, 22)
+    BG_BOTTOM = (18, 23, 46)
+    PANEL_BG = (14, 18, 36, 218)
+    PANEL_BORDER = (95, 125, 190, 115)
+    TEXT_BRIGHT = (240, 245, 255)
+    TEXT_SOFT = (165, 182, 218)
+    TEXT_ACCENT = (115, 228, 255)
+
+    def __init__(
+        self,
+        graph: Graph,
+        solver: Solver,
+        width: int = 1420,
+        height: int = 860,
+    ) -> None:
+        self.graph = graph
+        self.solver = solver
+        self.width = width
+        self.height = height
+
+        # Continuous simulation clock
+        self.sim_time: float = 0.0
+        self.playing: bool = True
+        self.turns_per_sec: float = 1.15
+
+        # Label modes:
+        # drone_label_mode: 0 = Smart (active), 1 = All, 2 = Hidden
+        self.show_node_names: bool = True
+        self.drone_label_mode: int = 0
+
+        # Interactive selection and inspection
+        self.selected_hub: str | None = None
+        self.selected_drone: str | None = None
+        self.hovered_hub: str | None = None
+        self.hovered_drone: str | None = None
+
+        # Indexed simulation structures
+        self.step_map: dict[str, dict[int, ScheduledStep]] = {}
+        self.arrival_turns: dict[str, int] = {}
+        self.departure_turns: dict[str, int] = {}
+        self.drone_colors: dict[str, tuple[int, int, int]] = {}
+        self.trails: dict[str, deque[tuple[float, float]]] = {}
+        self.shockwaves: list[Shockwave] = []
+        self._triggered_arrivals: set[str] = set()
+        self._init_simulation_structures()
+
+        # Auxiliary engines
+        self.glow = GlowCache()
+        self.camera = SmoothCamera2D(width, height)
+        self.camera.fit_graph(graph, instant=True)
+        self.label_engine = OrganicLabelEngine(graph)
+
+        # Cache text surfaces to avoid rerendering fonts every frame
+        self._node_text_cache: dict[str, pygame.Surface] = {}
+        self._drone_text_cache: dict[str, pygame.Surface] = {}
+        self._bg_surface: pygame.Surface | None = None
+
+        # Starfield with multilayer parallax
+        rng = random.Random(42)
+        self.stars = [
+            (
+                rng.uniform(0, 2000),
+                rng.uniform(0, 1400),
+                rng.uniform(1.0, 2.5),
+                rng.uniform(0.08, 0.35),  # Parallax factor
+                rng.uniform(0.0, math.pi * 2.0),  # Twinkle phase
+            )
+            for _ in range(85)
+        ]
+
+    def _init_simulation_structures(self) -> None:
+        for idx, drone in enumerate(self.solver.drones):
+            self.drone_colors[drone.id] = golden_angle_drone_color(idx)
+            steps = self.solver.schedules.get(drone.id, [])
+            self.step_map[drone.id] = {s.turn: s for s in steps}
+            self.arrival_turns[drone.id] = steps[-1].turn if steps else 0
+
+            dep = 0
+            for s in steps:
+                if not s.is_wait:
+                    dep = s.turn - 1
+                    break
+            self.departure_turns[drone.id] = dep
+            self.trails[drone.id] = deque(maxlen=22)
+
+    def _drone_zone_at_turn(self, drone_id: str, turn_idx: int) -> str:
+        start_name = self.graph.start.name if self.graph.start else ""
+        end_name = self.graph.end.name if self.graph.end else ""
+        if turn_idx <= 0:
+            return start_name
+        arrival = self.arrival_turns.get(drone_id, 0)
+        if arrival > 0 and turn_idx >= arrival:
+            return end_name
+        step = self.step_map.get(drone_id, {}).get(turn_idx)
+        return step.to_zone if step is not None else start_name
+
+    def _compute_drone_kinematics(
+        self, drone_id: str, sim_t: float
+    ) -> tuple[float, float, float, str, str, bool, bool]:
+        """
+        Calculate the continuous position (wx, wy), heading angle, group key,
+        readable status, and activity flags.
+        """
+        start_hub = self.graph.start
+        end_hub = self.graph.end
+        assert start_hub is not None and end_hub is not None
+
+        if sim_t <= 0.0:
+            return (
+                float(start_hub.x),
+                float(start_hub.y),
+                -math.pi * 0.5,
+                f"hub:{start_hub.name}",
+                f"At start ({start_hub.name})",
+                False,
+                False,
+            )
+
+        arrival_t = self.arrival_turns.get(drone_id, 0)
+        if arrival_t == 0 or sim_t >= float(arrival_t):
+            return (
+                float(end_hub.x),
+                float(end_hub.y),
+                -math.pi * 0.5,
+                f"hub:{end_hub.name}",
+                f"At goal ({end_hub.name})",
+                False,
+                False,
+            )
+
+        current_turn = int(math.floor(sim_t)) + 1
+        raw_alpha = sim_t - math.floor(sim_t)
+
+        d_steps = self.step_map.get(drone_id, {})
+        step = d_steps.get(current_turn)
+
+        if step is None or step.is_wait:
+            zone_name = (
+                step.from_zone
+                if step is not None
+                else self._drone_zone_at_turn(drone_id, current_turn - 1)
+            )
+            hub = self.graph.nodes_dict[zone_name]
+            is_active = zone_name not in (start_hub.name, end_hub.name)
+            status = (
+                f"Waiting at {zone_name}"
+                if is_active
+                else f"Ready at {zone_name}"
+            )
+            return (
+                float(hub.x),
+                float(hub.y),
+                -math.pi * 0.5,
+                f"hub:{zone_name}",
+                status,
+                is_active,
+                False,
+            )
+
+        u = self.graph.nodes_dict[step.from_zone]
+        v = self.graph.nodes_dict[step.to_zone]
+        heading = math.atan2(-(v.y - u.y), float(v.x - u.x))
+
+        # Check whether the drone was moving on the previous turn or will continue
+        # on the next one, so it can maintain speed through intermediate hubs.
+        prev_step = d_steps.get(current_turn - 1)
+        next_step = d_steps.get(current_turn + 1)
+        continuous_entry = (
+            prev_step is not None
+            and not prev_step.is_wait
+            and prev_step.to_zone == step.from_zone
+        )
+        continuous_exit = (
+            next_step is not None
+            and not next_step.is_wait
+            and next_step.from_zone == step.to_zone
+        )
+
+        if continuous_entry and continuous_exit:
+            # Blend linear and sine easing to preserve momentum through a hub.
+            alpha = 0.45 * raw_alpha + 0.55 * ease_in_out_sine(raw_alpha)
+        else:
+            alpha = ease_in_out_sine(raw_alpha)
+
+        # Case 1: First turn entering a RESTRICTED hub (first half of the edge).
+        if step.is_restricted_transit:
+            frac = 0.5 * ease_in_out_sine(raw_alpha)
+            return (
+                u.x + (v.x - u.x) * frac,
+                u.y + (v.y - u.y) * frac,
+                heading,
+                f"edge:{u.name}->{v.name}:1",
+                f"Restricted transit {u.name} → {v.name} (1/2)",
+                True,
+                True,
+            )
+
+        # Case 2: Second turn entering a RESTRICTED hub (second half of the edge).
+        if prev_step is not None and prev_step.is_restricted_transit:
+            frac = 0.5 + 0.5 * ease_in_out_sine(raw_alpha)
+            return (
+                u.x + (v.x - u.x) * frac,
+                u.y + (v.y - u.y) * frac,
+                heading,
+                f"edge:{u.name}->{v.name}:2",
+                f"Landing at {v.name} [RESTRICTED] (2/2)",
+                True,
+                True,
+            )
+
+        # Case 3: Standard transit (1 turn).
+        return (
+            u.x + (v.x - u.x) * alpha,
+            u.y + (v.y - u.y) * alpha,
+            heading,
+            f"edge:{u.name}->{v.name}",
+            f"Flying {u.name} → {v.name}",
+            True,
+            False,
+        )
+
+    def _compute_all_drones_render_state(
+        self, elapsed: float
+    ) -> tuple[list[DroneRenderState], dict[str, list[str]]]:
+        """Calculate drones' screen positions and orbital formations."""
+        raw: list[tuple[str, float, float, float, str, str, bool, bool]] = []
+        groups: dict[str, list[str]] = {}
+
+        for drone in self.solver.drones:
+            wx, wy, heading, gkey, status, is_active, in_rest = (
+                self._compute_drone_kinematics(drone.id, self.sim_time)
+            )
+            raw.append((drone.id, wx, wy, heading, gkey, status, is_active, in_rest))
+            groups.setdefault(gkey, []).append(drone.id)
+
+            # Detect arrival at the goal and launch a harmonic shockwave.
+            arr_t = self.arrival_turns.get(drone.id, 0)
+            if arr_t > 0 and self.sim_time >= float(arr_t):
+                if drone.id not in self._triggered_arrivals and self.graph.end:
+                    self._triggered_arrivals.add(drone.id)
+                    self.shockwaves.append(
+                        Shockwave(
+                            x=float(self.graph.end.x),
+                            y=float(self.graph.end.y),
+                            color=self.drone_colors[drone.id],
+                        )
+                    )
+            else:
+                self._triggered_arrivals.discard(drone.id)
+
+        states: list[DroneRenderState] = []
+        for did, wx, wy, heading, gkey, status, is_active, in_rest in raw:
+            sx, sy = self.camera.to_screen_float(wx, wy)
+            members = groups[gkey]
+            if len(members) > 1:
+                idx = members.index(did)
+                angle = (2.0 * math.pi * idx) / len(members) + elapsed * 0.85
+                orbit_px = min(22.0, 6.5 + len(members) * 1.15)
+                sx += math.cos(angle) * orbit_px
+                sy += math.sin(angle) * orbit_px
+
+            states.append(
+                DroneRenderState(
+                    drone_id=did,
+                    wx=wx,
+                    wy=wy,
+                    sx=sx,
+                    sy=sy,
+                    heading_rad=heading,
+                    group_key=gkey,
+                    status_text=status,
+                    is_active=is_active,
+                    in_restricted=in_rest,
+                )
+            )
+
+            if self.playing and is_active:
+                self.trails[did].append((wx, wy))
+
+        return states, groups
+
+==> Frontend/visualizer_rendering.py <==
+"""Pygame drawing routines for the Fly-In visualization."""
+from __future__ import annotations
+
+import math
+
+import pygame
+
+from Backend.Zones.hub_type import HubType
+from Frontend.visualizer_support import (
+    DroneRenderState,
+    clamp,
+    resolve_color,
+)
+from Frontend.visualizer_context import _VisualizerContext
+
+__all__ = ["_VisualizerRendering"]
+
+
+class _VisualizerRendering(_VisualizerContext):
+    """Visual presentation layer mixed into :class:`FlyInVisualizer`."""
+
+    def _build_background_surface(self) -> pygame.Surface:
+        """Pre-render the nighttime atmospheric gradient and soft nebulae."""
+        surf = pygame.Surface((self.width, self.height))
+        for y in range(self.height):
+            t = y / max(1, self.height - 1)
+            r = int(self.BG_TOP[0] + (self.BG_BOTTOM[0] - self.BG_TOP[0]) * t)
+            g = int(self.BG_TOP[1] + (self.BG_BOTTOM[1] - self.BG_TOP[1]) * t)
+            b = int(self.BG_TOP[2] + (self.BG_BOTTOM[2] - self.BG_TOP[2]) * t)
+            pygame.draw.line(surf, (r, g, b), (0, y), (self.width, y))
+
+        # Subtle atmospheric auroras in the background.
+        nebula = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        self.glow.draw(
+            nebula,
+            (int(self.width * 0.25), int(self.height * 0.3)),
+            int(min(self.width, self.height) * 0.42),
+            (45, 85, 165),
+            peak_alpha=24,
+        )
+        self.glow.draw(
+            nebula,
+            (int(self.width * 0.75), int(self.height * 0.68)),
+            int(min(self.width, self.height) * 0.45),
+            (95, 50, 145),
+            peak_alpha=20,
+        )
+        surf.blit(nebula, (0, 0))
+        return surf
+
+    def _draw_atmosphere(self, surface: pygame.Surface, elapsed: float) -> None:
+        if self._bg_surface is None or self._bg_surface.get_size() != (
+            self.width,
+            self.height,
+        ):
+            self._bg_surface = self._build_background_surface()
+        surface.blit(self._bg_surface, (0, 0))
+
+        # Subtle geometric grid when zoomed in close enough.
+        if self.camera.zoom >= 28.0:
+            step_px = max(36, int(round(self.camera.zoom * 2.0)))
+            ox = int(self.camera.offset_x) % step_px
+            oy = int(self.camera.offset_y) % step_px
+            grid_col = (20, 26, 48)
+            for x in range(ox, self.width, step_px):
+                pygame.draw.line(surface, grid_col, (x, 0), (x, self.height), 1)
+            for y in range(oy, self.height, step_px):
+                pygame.draw.line(surface, grid_col, (0, y), (self.width, y), 1)
+
+        # Starfield with parallax as the camera moves.
+        for bx, by, rad, p_factor, phase in self.stars:
+            sx = int(
+                (
+                    bx
+                    + self.camera.offset_x * p_factor
+                    + elapsed * 3.5 * p_factor
+                )
+                % self.width
+            )
+            sy = int(
+                (
+                    by
+                    + self.camera.offset_y * p_factor
+                    - elapsed * 5.0 * p_factor
+                )
+                % self.height
+            )
+            twinkle = 0.5 + 0.5 * math.sin(elapsed * 2.2 + phase)
+            r_int = max(1, int(rad * (0.75 + 0.35 * twinkle)))
+            c_val = int(155 + 90 * twinkle)
+            pygame.draw.circle(surface, (c_val - 20, c_val, 255), (sx, sy), r_int)
+
+    def _draw_connections(self, surface: pygame.Surface, elapsed: float) -> None:
+        """
+        Draw connections as energy conduits. If drones are crossing on the
+        current turn, emit glowing photons moving in the direction of travel.
+        """
+        active_turn = min(self.solver.total_turns, int(math.floor(self.sim_time)) + 1)
+        if self.sim_time <= 0.0 or self.sim_time >= float(self.solver.total_turns):
+            active_turn = 0
+
+        # Collect the directed edges active on the current turn.
+        active_Transits: dict[str, tuple[str, str, int, bool]] = {}
+        if active_turn > 0:
+            for d in self.solver.drones:
+                st = self.step_map.get(d.id, {}).get(active_turn)
+                if st is not None and not st.is_wait:
+                    cid = self.solver._canonical_link_id(st.connection)
+                    prev_count = active_Transits.get(cid, ("", "", 0, False))[2]
+                    active_Transits[cid] = (
+                        st.from_zone,
+                        st.to_zone,
+                        prev_count + 1,
+                        st.is_restricted_transit,
+                    )
+
+        # Edges along the route of the selected drone or the one under the cursor.
+        highlighted_drone_id = self.selected_drone or self.hovered_drone
+        highlighted_edges: set[str] = set()
+        if highlighted_drone_id:
+            for st in self.solver.schedules.get(highlighted_drone_id, []):
+                if not st.is_wait:
+                    highlighted_edges.add(self.solver._canonical_link_id(st.connection))
+
+        for link in self.graph.link_dict.values():
+            u = self.graph.nodes_dict[link.from_zone]
+            v = self.graph.nodes_dict[link.to_zone]
+            p1 = self.camera.to_screen(u.x, u.y)
+            p2 = self.camera.to_screen(v.x, v.y)
+
+            cid = self.solver._canonical_link_id(link)
+            is_highlighted = cid in highlighted_edges
+            transit_info = active_Transits.get(cid)
+
+            if is_highlighted:
+                pygame.draw.line(surface, (75, 165, 235), p1, p2, 6)
+                pygame.draw.aaline(surface, (215, 248, 255), p1, p2)
+            elif transit_info is not None:
+                from_z, to_z, _, is_rest = transit_info
+                glow_col = (245, 145, 85) if is_rest else (70, 155, 235)
+                core_col = (255, 220, 175) if is_rest else (175, 240, 255)
+                pygame.draw.line(surface, glow_col, p1, p2, 4)
+                pygame.draw.aaline(surface, core_col, p1, p2)
+
+                # Emit photon pulses traveling from `from_z` to `to_z`.
+                src_hub = self.graph.nodes_dict[from_z]
+                dst_hub = self.graph.nodes_dict[to_z]
+                sp1 = self.camera.to_screen_float(src_hub.x, src_hub.y)
+                sp2 = self.camera.to_screen_float(dst_hub.x, dst_hub.y)
+                for p_idx in range(2):
+                    phase = (elapsed * 1.6 + p_idx * 0.5) % 1.0
+                    px = int(sp1[0] + (sp2[0] - sp1[0]) * phase)
+                    py = int(sp1[1] + (sp2[1] - sp1[1]) * phase)
+                    self.glow.draw(surface, (px, py), 7, core_col, peak_alpha=95)
+                    pygame.draw.circle(surface, (255, 255, 255), (px, py), 2)
+            else:
+                # Idle cable: subtle and elegant.
+                pygame.draw.line(surface, (28, 36, 62), p1, p2, 2)
+                pygame.draw.aaline(surface, (54, 68, 106), p1, p2)
+
+    def _draw_hubs(
+        self, surface: pygame.Surface, elapsed: float
+    ) -> dict[str, tuple[int, int]]:
+        """Draw hubs with sacred geometry, soft glows, and capacity indicators."""
+        node_radius = int(clamp(self.camera.zoom * 0.20, 9.0, 24.0))
+        screen_positions: dict[str, tuple[int, int]] = {}
+
+        active_turn = min(self.solver.total_turns, int(math.floor(self.sim_time)) + 1)
+        if self.sim_time <= 0.0 or self.sim_time >= float(self.solver.total_turns):
+            active_turn = int(round(self.sim_time))
+
+        # Expanding waves at the goal.
+        for sw in list(self.shockwaves):
+            sx, sy = self.camera.to_screen(sw.x, sw.y)
+            r = int(node_radius + sw.progress * node_radius * 3.8)
+            alpha = int(clamp((1.0 - sw.progress) * 190, 0, 255))
+            if alpha > 5:
+                ring_surf = pygame.Surface((r * 2 + 6, r * 2 + 6), pygame.SRCALPHA)
+                pygame.draw.circle(
+                    ring_surf, (*sw.color, alpha), (r + 3, r + 3), r, width=2
+                )
+                surface.blit(ring_surf, (sx - r - 3, sy - r - 3))
+
+        for name, hub in self.graph.nodes_dict.items():
+            sx, sy = self.camera.to_screen(hub.x, hub.y)
+            screen_positions[name] = (sx, sy)
+            col = resolve_color(hub.color, elapsed)
+
+            is_focus = name in (self.selected_hub, self.hovered_hub)
+            breath = 1.0 + 0.08 * math.sin(elapsed * 2.4 + hub.x * 0.5 + hub.y * 0.5)
+            glow_r = int(node_radius * (2.6 if is_focus else 2.0) * breath)
+
+            # 1. Bioluminescent aura.
+            self.glow.draw(
+                surface, (sx, sy), glow_r, col, peak_alpha=95 if is_focus else 62
+            )
+
+            # 2. Outer geometry based on the hub's role.
+            if hub.directive == "start_hub":
+                # Double orbital ring at the start.
+                pygame.draw.circle(
+                    surface, (105, 242, 215), (sx, sy), node_radius + 7, width=2
+                )
+                for k in range(3):
+                    ang = elapsed * 1.4 + k * (2.0 * math.pi / 3.0)
+                    ox = sx + int(math.cos(ang) * (node_radius + 7))
+                    oy = sy + int(math.sin(ang) * (node_radius + 7))
+                    pygame.draw.circle(surface, (220, 255, 245), (ox, oy), 2)
+
+            elif hub.directive == "end_hub":
+                # Harmonic crown at the goal.
+                pygame.draw.circle(surface, col, (sx, sy), node_radius + 8, width=2)
+                pygame.draw.circle(
+                    surface, (255, 255, 255), (sx, sy), node_radius + 4, width=1
+                )
+
+            elif hub.zone == HubType.PRIORITY:
+                # Golden orbital diamond for PRIORITY hubs.
+                d = node_radius + 6
+                pts = [(sx, sy - d), (sx + d, sy), (sx, sy + d), (sx - d, sy)]
+                pygame.draw.polygon(surface, (255, 220, 115), pts, width=2)
+
+            elif hub.zone == HubType.RESTRICTED:
+                # Amber-crimson containment ring for RESTRICTED hubs (2 turns).
+                pygame.draw.circle(
+                    surface, (255, 115, 95), (sx, sy), node_radius + 4, width=2
+                )
+
+            elif hub.zone == HubType.BLOCKED:
+                pygame.draw.circle(
+                    surface, (240, 75, 95), (sx, sy), node_radius + 3, width=2
+                )
+
+            # 3. Multilayer hub core.
+            pygame.draw.circle(surface, (14, 18, 34), (sx, sy), node_radius + 2)
+            pygame.draw.circle(surface, col, (sx, sy), node_radius)
+            # Inner crystalline reflection.
+            inner_r = max(3, int(node_radius * 0.42))
+            pygame.draw.circle(surface, (250, 253, 255), (sx, sy), inner_r)
+
+            # 4. Orbital occupancy indicators (`used / max_drones`, without text).
+            if (
+                hub.directive not in ("start_hub", "end_hub")
+                and 1 <= hub.max_drones <= 6
+                and self.camera.zoom >= 32.0
+            ):
+                occ = self.solver.hub_reservations[name].get(active_turn, 0)
+                pip_r = node_radius + 6
+                for p in range(hub.max_drones):
+                    ang = -math.pi * 0.5 + (p - (hub.max_drones - 1) * 0.5) * 0.42
+                    px = sx + int(math.cos(ang) * pip_r)
+                    py = sy + int(math.sin(ang) * pip_r)
+                    p_col = (125, 245, 255) if p < occ else (55, 68, 102)
+                    pygame.draw.circle(surface, p_col, (px, py), 2)
+
+            if is_focus:
+                pygame.draw.circle(
+                    surface, (255, 255, 255), (sx, sy), node_radius + 10, width=2
+                )
+
+        return screen_positions
+
+    def _draw_drones(
+        self, surface: pygame.Surface, drone_states: list[DroneRenderState]
+    ) -> None:
+        """Draw tapered silk trails and the oriented drone bodies."""
+        drone_radius = int(clamp(self.camera.zoom * 0.105, 5.0, 11.0))
+
+        # 1. Tapered ribbon trails.
+        for st in drone_states:
+            if not st.is_active:
+                continue
+            pts = [self.camera.to_screen(wx, wy) for wx, wy in self.trails[st.drone_id]]
+            if len(pts) >= 2:
+                col = self.drone_colors[st.drone_id]
+                pygame.draw.aalines(surface, col, False, pts)
+                # Decreasing points of light along the trail.
+                for i in range(0, len(pts), 3):
+                    frac = (i + 1) / len(pts)
+                    r_pt = max(1, int(drone_radius * 0.55 * frac))
+                    pygame.draw.circle(surface, col, pts[i], r_pt)
+
+        # 2. Glowing body and directional nose of each drone.
+        for st in drone_states:
+            ix, iy = int(round(st.sx)), int(round(st.sy))
+            col = self.drone_colors[st.drone_id]
+            is_focus = st.drone_id in (self.selected_drone, self.hovered_drone)
+
+            self.glow.draw(
+                surface,
+                (ix, iy),
+                int(drone_radius * (3.0 if is_focus else 2.2)),
+                col,
+                peak_alpha=105 if is_focus else 72,
+            )
+
+            # Show an amber containment halo while crossing a RESTRICTED hub.
+            if st.in_restricted:
+                pygame.draw.circle(
+                    surface, (255, 165, 80), (ix, iy), drone_radius + 4, width=1
+                )
+
+            # Draw a soft, oriented droplet/firefly silhouette while in flight.
+            if st.is_active:
+                nose_x = ix + int(math.cos(st.heading_rad) * (drone_radius + 3))
+                nose_y = iy + int(math.sin(st.heading_rad) * (drone_radius + 3))
+                pygame.draw.line(
+                    surface, (255, 255, 255), (ix, iy), (nose_x, nose_y), 2
+                )
+
+            pygame.draw.circle(surface, (12, 16, 30), (ix, iy), drone_radius + 1)
+            pygame.draw.circle(surface, col, (ix, iy), drone_radius)
+            pygame.draw.circle(
+                surface, (255, 255, 255), (ix, iy), max(2, drone_radius // 2)
+            )
+
+            if is_focus:
+                pygame.draw.circle(
+                    surface, (255, 255, 255), (ix, iy), drone_radius + 6, width=2
+                )
+
+    def _draw_pill_badge(
+        self,
+        surface: pygame.Surface,
+        text_surf: pygame.Surface,
+        anchor: tuple[int, int],
+        center_pos: tuple[float, float],
+        border_color: tuple[int, int, int],
+        bg_alpha: int = 195,
+    ) -> None:
+        """Draw a frosted-glass pill with a subtle leader line when separated."""
+        tw, th = text_surf.get_size()
+        pad_x, pad_y = 7, 3
+        bw, bh = tw + pad_x * 2, th + pad_y * 2
+        cx, cy = int(round(center_pos[0])), int(round(center_pos[1]))
+        rect = pygame.Rect(cx - bw // 2, cy - bh // 2, bw, bh)
+
+        # Subtle leader line between the object and its label.
+        dist = math.hypot(cx - anchor[0], cy - anchor[1])
+        if dist > 20.0:
+            pygame.draw.aaline(surface, (*border_color, 95), anchor, (cx, cy))
+
+        pill = pygame.Surface((bw, bh), pygame.SRCALPHA)
+        pygame.draw.rect(
+            pill, (14, 18, 36, bg_alpha), (0, 0, bw, bh), border_radius=8
+        )
+        pygame.draw.rect(
+            pill, (*border_color, 145), (0, 0, bw, bh), width=1, border_radius=8
+        )
+        surface.blit(pill, rect.topleft)
+        surface.blit(text_surf, (rect.x + pad_x, rect.y + pad_y))
+
+    def _draw_all_labels(
+        self,
+        surface: pygame.Surface,
+        node_screen_pos: dict[str, tuple[int, int]],
+        drone_states: list[DroneRenderState],
+        groups: dict[str, list[str]],
+        font_node: pygame.font.Font,
+        font_drone: pygame.font.Font,
+        elapsed: float,
+        dt: float,
+    ) -> None:
+        """Update damped label physics and render labels without flicker."""
+        node_radius = int(clamp(self.camera.zoom * 0.20, 9.0, 24.0))
+        drone_radius = int(clamp(self.camera.zoom * 0.105, 5.0, 11.0))
+
+        # 1. Cache hub text surfaces and update their dimensions.
+        for name in self.graph.nodes_dict:
+            if name not in self._node_text_cache:
+                self._node_text_cache[name] = font_node.render(
+                    name, True, self.TEXT_BRIGHT
+                )
+            ts = self._node_text_cache[name]
+            st = self.label_engine.node_labels[name]
+            st.width, st.height = ts.get_width() + 14, ts.get_height() + 6
+
+        self.label_engine.update_node_labels(node_screen_pos, node_radius, dt)
+
+        # Draw hub labels.
+        if self.show_node_names:
+            for name, hub in self.graph.nodes_dict.items():
+                ax, ay = node_screen_pos[name]
+                st = self.label_engine.node_labels[name]
+                col = resolve_color(hub.color, elapsed)
+                self._draw_pill_badge(
+                    surface=surface,
+                    text_surf=self._node_text_cache[name],
+                    anchor=(ax, ay),
+                    center_pos=(ax + st.cur_dx, ay + st.cur_dy),
+                    border_color=col,
+                    bg_alpha=190,
+                )
+
+        # 2. Drone labels (with smooth physics).
+        if self.drone_label_mode == 2:
+            return
+
+        active_tuples: list[tuple[str, float, float]] = []
+        for dst in drone_states:
+            show_this = (
+                self.drone_label_mode == 1
+                or dst.is_active
+                or dst.drone_id in (self.selected_drone, self.hovered_drone)
+                or len(groups.get(dst.group_key, [])) <= 3
+            )
+            if show_this:
+                if dst.drone_id not in self._drone_text_cache:
+                    self._drone_text_cache[dst.drone_id] = font_drone.render(
+                        dst.drone_id, True, self.drone_colors[dst.drone_id]
+                    )
+                active_tuples.append((dst.drone_id, dst.sx, dst.sy))
+
+        self.label_engine.update_drone_labels(
+            active_tuples, node_screen_pos, drone_radius, dt
+        )
+
+        for did, sx, sy in active_tuples:
+            st = self.label_engine.drone_labels[did]
+            ts = self._drone_text_cache[did]
+            st.width, st.height = ts.get_width() + 12, ts.get_height() + 6
+            self._draw_pill_badge(
+                surface=surface,
+                text_surf=ts,
+                anchor=(int(round(sx)), int(round(sy))),
+                center_pos=(sx + st.cur_dx, sy + st.cur_dy),
+                border_color=self.drone_colors[did],
+                bg_alpha=215,
+            )
+
+    def _draw_inspector_card(
+        self,
+        surface: pygame.Surface,
+        drone_states: list[DroneRenderState],
+        font_title: pygame.font.Font,
+        font_body: pygame.font.Font,
+    ) -> None:
+        """Floating side panel with live telemetry for the selected hub or drone."""
+        target_drone = self.selected_drone or self.hovered_drone
+        target_hub = self.selected_hub or self.hovered_hub
+
+        if not target_drone and not target_hub:
+            return
+
+        card_w, card_h = 310, 175
+        card_x, card_y = self.width - card_w - 24, 78
+        card = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
+        pygame.draw.rect(
+            card, self.PANEL_BG, (0, 0, card_w, card_h), border_radius=14
+        )
+        pygame.draw.rect(
+            card,
+            self.PANEL_BORDER,
+            (0, 0, card_w, card_h),
+            width=1,
+            border_radius=14,
+        )
+
+        lines: list[tuple[str, tuple[int, int, int]]] = []
+
+        if target_drone:
+            col = self.drone_colors.get(target_drone, self.TEXT_ACCENT)
+            dst = next((d for d in drone_states if d.drone_id == target_drone), None)
+            arr_t = self.arrival_turns.get(target_drone, 0)
+            dep_t = self.departure_turns.get(target_drone, 0)
+            steps = [
+                s.to_zone
+                for s in self.solver.schedules.get(target_drone, [])
+                if not s.is_wait and not s.is_restricted_transit
+            ]
+            route_preview = " → ".join(steps[:4]) + (" …" if len(steps) > 4 else "")
+
+            lines.append((f"✦ DRONE {target_drone}", col))
+            if dst:
+                lines.append((f"Status: {dst.status_text}", self.TEXT_BRIGHT))
+            lines.append(
+                (f"Departure: Turn {dep_t}   ·   Arrival: Turn {arr_t}", self.TEXT_SOFT)
+            )
+            lines.append((f"Total hops: {len(steps)} connections", self.TEXT_SOFT))
+            lines.append((f"Route: {route_preview}", self.TEXT_ACCENT))
+
+        elif target_hub and target_hub in self.graph.nodes_dict:
+            hub = self.graph.nodes_dict[target_hub]
+            active_turn = min(
+                self.solver.total_turns, int(math.floor(self.sim_time)) + 1
+            )
+            occ = self.solver.hub_reservations[target_hub].get(active_turn, 0)
+            h_val = self.solver.heuristics.get(target_hub, -1)
+            neighbors = len(self.graph.get_neighbors(target_hub))
+
+            lines.append((f"✦ HUB: {hub.name}", self.TEXT_ACCENT))
+            lines.append(
+                (
+                    f"Type: {hub.zone.value.upper()}   ·   Role: {hub.directive}",
+                    self.TEXT_BRIGHT,
+                )
+            )
+            lines.append(
+                (
+                    f"Coordinates: ({hub.x}, {hub.y})   ·   Links: {neighbors}",
+                    self.TEXT_SOFT,
+                )
+            )
+            if hub.directive in ("start_hub", "end_hub"):
+                lines.append(("Capacity: Unlimited (terminal)", self.TEXT_SOFT))
+            else:
+                lines.append(
+                    (
+                        f"Current occupancy: {occ} / {hub.max_drones} drones",
+                        self.TEXT_SOFT,
+                    )
+                )
+            if h_val >= 0:
+                lines.append(
+                    (f"Minimum distance to goal h(u): {h_val} turns", self.TEXT_ACCENT)
+                )
+
+        y_off = 16
+        for idx, (txt, col) in enumerate(lines):
+            f = font_title if idx == 0 else font_body
+            surf = f.render(txt, True, col)
+            card.blit(surf, (18, y_off))
+            y_off += 30 if idx == 0 else 26
+
+        surface.blit(card, (card_x, card_y))
+
+    def _draw_hud(
+        self,
+        surface: pygame.Surface,
+        font_title: pygame.font.Font,
+        font_ui: pygame.font.Font,
+        font_small: pygame.font.Font,
+    ) -> None:
+        """Minimal frosted-glass top and bottom interface."""
+        # Top bar.
+        top_w = self.width - 40
+        top = pygame.Surface((top_w, 50), pygame.SRCALPHA)
+        pygame.draw.rect(top, self.PANEL_BG, (0, 0, top_w, 50), border_radius=14)
+        pygame.draw.rect(
+            top, self.PANEL_BORDER, (0, 0, top_w, 50), width=1, border_radius=14
+        )
+        surface.blit(top, (20, 14))
+
+        turn_disp = int(math.ceil(self.sim_time - 1e-6)) if self.sim_time > 1e-5 else 0
+        arrived = sum(
+            1
+            for d in self.solver.drones
+            if self.arrival_turns.get(d.id, 0) > 0
+            and self.sim_time >= float(self.arrival_turns[d.id]) - 1e-5
+        )
+
+        surface.blit(
+            font_title.render("✦ FLY-IN // ASTRAL ENGINE", True, self.TEXT_BRIGHT),
+            (38, 28),
+        )
+
+        st_label = "● PLAYING" if self.playing else "● PAUSED"
+        st_color = (105, 242, 195) if self.playing else (255, 215, 115)
+        surface.blit(font_ui.render(st_label, True, st_color), (310, 30))
+
+        stats_txt = (
+            f"Turn: {turn_disp} / {self.solver.total_turns}     ·     "
+            f"At Goal: {arrived} / {self.graph.n_drones}     ·     "
+            f"Speed: {self.turns_per_sec:.2f} turns/s"
+        )
+        surface.blit(font_ui.render(stats_txt, True, self.TEXT_BRIGHT), (485, 30))
+
+        # Bottom bar with interactive timeline.
+        bot_w = self.width - 40
+        bot = pygame.Surface((bot_w, 58), pygame.SRCALPHA)
+        pygame.draw.rect(bot, self.PANEL_BG, (0, 0, bot_w, 58), border_radius=14)
+        pygame.draw.rect(
+            bot, self.PANEL_BORDER, (0, 0, bot_w, 58), width=1, border_radius=14
+        )
+        surface.blit(bot, (20, self.height - 72))
+
+        bar_x, bar_y, bar_w, bar_h = 42, self.height - 56, self.width - 84, 8
+        pygame.draw.rect(
+            surface, (34, 44, 78), (bar_x, bar_y, bar_w, bar_h), border_radius=4
+        )
+
+        # Subtle turn markers on the timeline.
+        if 1 <= self.solver.total_turns <= 60:
+            for t_mark in range(1, self.solver.total_turns):
+                mx = bar_x + int((t_mark / self.solver.total_turns) * bar_w)
+                pygame.draw.line(
+                    surface, (55, 70, 115), (mx, bar_y), (mx, bar_y + bar_h - 1), 1
+                )
+
+        if self.solver.total_turns > 0:
+            pct = clamp(self.sim_time / float(self.solver.total_turns), 0.0, 1.0)
+            fill_w = int(bar_w * pct)
+            pygame.draw.rect(
+                surface, (105, 210, 255), (bar_x, bar_y, fill_w, bar_h), border_radius=4
+            )
+            knob_pos = (bar_x + fill_w, bar_y + bar_h // 2)
+            self.glow.draw(surface, knob_pos, 14, (125, 225, 255), peak_alpha=110)
+            pygame.draw.circle(surface, (245, 252, 255), knob_pos, 6)
+
+        mode_names = {0: "Active", 1: "All", 2: "Hidden"}
+        controls = (
+            f"[SPACE] Play/Pause  ·  [←/→] Turn  ·  [↑/↓] Speed  ·  "
+            f"[N] Hubs: {'ON' if self.show_node_names else 'OFF'}  ·  "
+            f"[D] Drones: {mode_names[self.drone_label_mode]}  ·  "
+            f"[F] Fit  ·  [Click] Inspect"
+        )
+        surface.blit(
+            font_small.render(controls, True, self.TEXT_SOFT), (42, self.height - 36)
+        )
+
+    def _update_hover(
+        self,
+        mouse_pos: tuple[int, int],
+        node_screen_pos: dict[str, tuple[int, int]],
+        drone_states: list[DroneRenderState],
+    ) -> None:
+        mx, my = mouse_pos
+        self.hovered_drone = None
+        self.hovered_hub = None
+
+        # Prioritize drones under the cursor.
+        best_d_dist = 16.0
+        for dst in drone_states:
+            d = math.hypot(mx - dst.sx, my - dst.sy)
+            if d < best_d_dist:
+                best_d_dist = d
+                self.hovered_drone = dst.drone_id
+
+        if self.hovered_drone is None:
+            best_h_dist = 24.0
+            for name, (hx, hy) in node_screen_pos.items():
+                d = math.hypot(mx - hx, my - hy)
+                if d < best_h_dist:
+                    best_h_dist = d
+                    self.hovered_hub = name
+
+==> Frontend/visualizer_runtime.py <==
+"""Pygame window lifecycle, input handling, and frame loop."""
+from __future__ import annotations
+
+import math
+
+import pygame
+
+from Frontend.visualizer_support import DroneRenderState, clamp
+from Frontend.visualizer_rendering import _VisualizerRendering
+
+__all__ = ["_PygameRuntime"]
+
+
+class _PygameRuntime(_VisualizerRendering):
+    """Technical Pygame runtime mixed into :class:`FlyInVisualizer`."""
+
+    def run(self) -> None:
+        pygame.init()
+        pygame.display.set_caption(
+            f"Fly-In Astral Visualizer — {self.graph.n_drones} Drones | "
+            f"{self.solver.total_turns} Turns"
+        )
+        screen = pygame.display.set_mode((self.width, self.height), pygame.RESIZABLE)
+        clock = pygame.time.Clock()
+
+        font_title = pygame.font.SysFont("sans", 16, bold=True)
+        font_ui = pygame.font.SysFont("sans", 14, bold=True)
+        font_node = pygame.font.SysFont("sans", 13, bold=True)
+        font_drone = pygame.font.SysFont("sans", 11, bold=True)
+        font_small = pygame.font.SysFont("sans", 12)
+
+        dragging_cam = False
+        scrubbing_timeline = False
+        last_mouse = (0, 0)
+        elapsed = 0.0
+
+        node_screen_pos: dict[str, tuple[int, int]] = {}
+        drone_states: list[DroneRenderState] = []
+
+        running = True
+        while running:
+            dt = clamp(clock.tick(60) / 1000.0, 0.001, 0.05)
+            elapsed += dt
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+
+                elif event.type == pygame.VIDEORESIZE:
+                    self.width, self.height = event.w, event.h
+                    self.camera.width, self.camera.height = event.w, event.h
+                    self._bg_surface = None
+                    screen = pygame.display.set_mode(
+                        (self.width, self.height), pygame.RESIZABLE
+                    )
+
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_SPACE:
+                        if self.sim_time >= float(self.solver.total_turns):
+                            self.sim_time = 0.0
+                            self._triggered_arrivals.clear()
+                            for tr in self.trails.values():
+                                tr.clear()
+                        self.playing = not self.playing
+                    elif event.key == pygame.K_r:
+                        self.sim_time = 0.0
+                        self._triggered_arrivals.clear()
+                        for tr in self.trails.values():
+                            tr.clear()
+                        self.playing = True
+                    elif event.key == pygame.K_f:
+                        self.camera.fit_graph(self.graph, instant=False)
+                    elif event.key == pygame.K_n:
+                        self.show_node_names = not self.show_node_names
+                    elif event.key == pygame.K_d:
+                        self.drone_label_mode = (self.drone_label_mode + 1) % 3
+                    elif event.key == pygame.K_l:
+                        self.show_node_names = not self.show_node_names
+                        self.drone_label_mode = 0 if self.show_node_names else 2
+                    elif event.key == pygame.K_RIGHT:
+                        self.playing = False
+                        self.sim_time = min(
+                            float(self.solver.total_turns),
+                            math.floor(self.sim_time + 1e-5) + 1.0,
+                        )
+                    elif event.key == pygame.K_LEFT:
+                        self.playing = False
+                        self.sim_time = max(
+                            0.0, math.ceil(self.sim_time - 1e-5) - 1.0
+                        )
+                        for tr in self.trails.values():
+                            tr.clear()
+                    elif event.key == pygame.K_UP:
+                        self.turns_per_sec = min(8.0, self.turns_per_sec * 1.25)
+                    elif event.key == pygame.K_DOWN:
+                        self.turns_per_sec = max(0.2, self.turns_per_sec / 1.25)
+
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1:
+                        if event.pos[1] >= self.height - 72:
+                            scrubbing_timeline = True
+                            self.playing = False
+                            bar_x, bar_w = 42, self.width - 84
+                            pct = clamp(
+                                (event.pos[0] - bar_x) / max(1, bar_w), 0.0, 1.0
+                            )
+                            self.sim_time = pct * float(self.solver.total_turns)
+                            for tr in self.trails.values():
+                                tr.clear()
+                        else:
+                            # Select a drone or hub for the inspector when clicked.
+                            if self.hovered_drone:
+                                self.selected_drone = (
+                                    None
+                                    if self.selected_drone == self.hovered_drone
+                                    else self.hovered_drone
+                                )
+                                self.selected_hub = None
+                            elif self.hovered_hub:
+                                self.selected_hub = (
+                                    None
+                                    if self.selected_hub == self.hovered_hub
+                                    else self.hovered_hub
+                                )
+                                self.selected_drone = None
+                            else:
+                                self.selected_drone = None
+                                self.selected_hub = None
+                            dragging_cam = True
+                            last_mouse = event.pos
+                    elif event.button == 4:
+                        self.camera.zoom_at(event.pos, 1.14)
+                    elif event.button == 5:
+                        self.camera.zoom_at(event.pos, 1.0 / 1.14)
+
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        dragging_cam = False
+                        scrubbing_timeline = False
+
+                elif event.type == pygame.MOUSEMOTION:
+                    if scrubbing_timeline:
+                        bar_x, bar_w = 42, self.width - 84
+                        pct = clamp((event.pos[0] - bar_x) / max(1, bar_w), 0.0, 1.0)
+                        self.sim_time = pct * float(self.solver.total_turns)
+                    elif dragging_cam:
+                        dx = event.pos[0] - last_mouse[0]
+                        dy = event.pos[1] - last_mouse[1]
+                        self.camera.pan(dx, dy)
+                        last_mouse = event.pos
+
+            # Update the camera, clock, and expanding shockwaves.
+            self.camera.update(dt)
+
+            if self.playing and self.solver.total_turns > 0:
+                self.sim_time += dt * self.turns_per_sec
+                if self.sim_time >= float(self.solver.total_turns):
+                    self.sim_time = float(self.solver.total_turns)
+                    self.playing = False
+
+            for sw in list(self.shockwaves):
+                sw.progress += dt * sw.speed
+                if sw.progress >= 1.0:
+                    self.shockwaves.remove(sw)
+
+            # Render all layers in order.
+            self._draw_atmosphere(screen, elapsed)
+            self._draw_connections(screen, elapsed)
+            node_screen_pos = self._draw_hubs(screen, elapsed)
+            drone_states, groups = self._compute_all_drones_render_state(elapsed)
+            self._draw_drones(screen, drone_states)
+            self._update_hover(pygame.mouse.get_pos(), node_screen_pos, drone_states)
+            self._draw_all_labels(
+                screen,
+                node_screen_pos,
+                drone_states,
+                groups,
+                font_node,
+                font_drone,
+                elapsed,
+                dt,
+            )
+            self._draw_inspector_card(screen, drone_states, font_title, font_small)
+            self._draw_hud(screen, font_title, font_ui, font_small)
+
+            pygame.display.flip()
+
+        pygame.quit()
+
+==> Frontend/visualizer_support.py <==
+"""Shared rendering utilities, visual state, camera, and label layout."""
+from __future__ import annotations
+
+import colorsys
+import math
+from dataclasses import dataclass
+
+import pygame
+
+from Backend.Zones.graph import Graph
+
+
+DREAM_PALETTE: dict[str, tuple[int, int, int]] = {
+    "white": (242, 246, 255),
+    "black": (78, 88, 120),
+    "red": (255, 102, 132),
+    "darkred": (210, 72, 108),
+    "crimson": (255, 82, 122),
+    "maroon": (188, 82, 132),
+    "green": (98, 238, 188),
+    "blue": (98, 188, 255),
+    "yellow": (255, 226, 126),
+    "gold": (255, 208, 96),
+    "orange": (255, 162, 108),
+    "purple": (192, 132, 255),
+    "violet": (222, 152, 255),
+    "brown": (205, 150, 115),
+    "cyan": (105, 242, 248),
+    "gray": (162, 178, 208),
+}
+
+
+def clamp(val: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, val))
+
+
+def smoothstep(t: float) -> float:
+    t = clamp(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def ease_in_out_sine(t: float) -> float:
+    t = clamp(t, 0.0, 1.0)
+    return -0.5 * (math.cos(math.pi * t) - 1.0)
+
+
+def exp_decay(current: float, target: float, speed: float, dt: float) -> float:
+    """Exponential interpolation independent of frame rate (no flicker)."""
+    factor = 1.0 - math.exp(-speed * dt)
+    return current + (target - current) * factor
+
+
+def resolve_color(color_name: str, elapsed: float = 0.0) -> tuple[int, int, int]:
+    clean = color_name.strip().lower()
+    if clean == "rainbow":
+        r, g, b = colorsys.hsv_to_rgb((elapsed * 0.14) % 1.0, 0.52, 1.0)
+        return int(r * 255), int(g * 255), int(b * 255)
+    return DREAM_PALETTE.get(clean, DREAM_PALETTE["white"])
+
+
+def golden_angle_drone_color(index: int) -> tuple[int, int, int]:
+    """Distribute drone colors using the golden ratio."""
+    hue = (0.52 + index * 0.618033988749895) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.48, 1.0)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+class GlowCache:
+    """Pre-render and cache soft radial glows to maintain 60 FPS."""
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple[int, tuple[int, int, int], int], pygame.Surface] = {}
+
+    def get(
+        self, radius: int, color: tuple[int, int, int], peak_alpha: int = 80
+    ) -> pygame.Surface:
+        r_quant = max(4, (radius // 2) * 2)
+        c_quant = (color[0] // 4 * 4, color[1] // 4 * 4, color[2] // 4 * 4)
+        key = (r_quant, c_quant, peak_alpha)
+
+        if key not in self._cache:
+            if len(self._cache) > 512:
+                self._cache.clear()
+            size = r_quant * 2
+            surf = pygame.Surface((size, size), pygame.SRCALPHA)
+            layers = 8
+            for i in range(layers, 0, -1):
+                frac = i / layers
+                sub_r = max(1, int(r_quant * frac))
+                # Smooth Gaussian falloff toward the edge.
+                falloff = math.exp(-3.2 * (frac * frac))
+                alpha = int(clamp(peak_alpha * falloff, 0, 255))
+                if alpha > 0:
+                    pygame.draw.circle(
+                        surf, (*c_quant, alpha), (r_quant, r_quant), sub_r
+                    )
+            self._cache[key] = surf
+        return self._cache[key]
+
+    def draw(
+        self,
+        target: pygame.Surface,
+        center: tuple[int, int],
+        radius: int,
+        color: tuple[int, int, int],
+        peak_alpha: int = 80,
+    ) -> None:
+        if radius <= 2:
+            return
+        sprite = self.get(radius, color, peak_alpha)
+        half = sprite.get_width() // 2
+        target.blit(
+            sprite,
+            (center[0] - half, center[1] - half),
+            special_flags=pygame.BLEND_PREMULTIPLIED if False else 0,
+        )
+
+
+@dataclass
+class Shockwave:
+    """Expanding harmonic wave emitted when a drone reaches the goal."""
+
+    x: float
+    y: float
+    color: tuple[int, int, int]
+    progress: float = 0.0
+    speed: float = 1.35
+
+
+@dataclass
+class SmoothLabelState:
+    """Persistent label state for smooth movement."""
+
+    rest_dx: float
+    rest_dy: float
+    cur_dx: float
+    cur_dy: float
+    width: int = 60
+    height: int = 20
+    alpha: float = 1.0
+
+
+class OrganicLabelEngine:
+    """
+    Calculate optimal label positions using initial topological analysis, then
+    apply continuously damped repulsion forces at runtime (no discrete jumps).
+    """
+
+    def __init__(self, graph: Graph) -> None:
+        self.graph = graph
+        self.node_labels: dict[str, SmoothLabelState] = {}
+        self.drone_labels: dict[str, SmoothLabelState] = {}
+        self._init_topological_node_offsets()
+
+    def _init_topological_node_offsets(self) -> None:
+        """
+        For each hub, analyze the angles of its connected edges and place its
+        label along the bisector of the largest open angle.
+        """
+        for name, hub in self.graph.nodes_dict.items():
+            neighbors = self.graph.get_neighbors(name)
+            edge_angles: list[float] = []
+
+            for link in neighbors:
+                other_name = link.get_destination(name)
+                other = self.graph.nodes_dict.get(other_name)
+                if other is not None:
+                    # The screen's Y axis is inverted (-dy).
+                    dx = float(other.x - hub.x)
+                    dy = float(-(other.y - hub.y))
+                    if abs(dx) > 1e-4 or abs(dy) > 1e-4:
+                        ang = math.atan2(dy, dx) % (2.0 * math.pi)
+                        edge_angles.append(ang)
+
+            if not edge_angles:
+                best_angle = math.pi * 0.5  # Below by default.
+            elif len(edge_angles) == 1:
+                best_angle = (edge_angles[0] + math.pi) % (2.0 * math.pi)
+            else:
+                edge_angles.sort()
+                best_gap = -1.0
+                best_angle = math.pi * 0.5
+                n = len(edge_angles)
+                for i in range(n):
+                    a1 = edge_angles[i]
+                    a2 = (
+                        edge_angles[(i + 1) % n]
+                        if i + 1 < n
+                        else edge_angles[0] + 2.0 * math.pi
+                    )
+                    gap = a2 - a1
+                    mid = (a1 + a2) * 0.5
+                    # Slight aesthetic preference for placing labels above or below.
+                    vertical_bonus = 0.15 * abs(math.sin(mid))
+                    if gap + vertical_bonus > best_gap:
+                        best_gap = gap + vertical_bonus
+                        best_angle = mid % (2.0 * math.pi)
+
+            dist = 28.0
+            rx = math.cos(best_angle) * dist * 1.15
+            ry = math.sin(best_angle) * dist
+            self.node_labels[name] = SmoothLabelState(
+                rest_dx=rx, rest_dy=ry, cur_dx=rx, cur_dy=ry
+            )
+
+    def update_node_labels(
+        self,
+        screen_positions: dict[str, tuple[int, int]],
+        node_radius: int,
+        dt: float,
+    ) -> None:
+        """
+        Smoothly relax node labels relative to one another using continuous
+        forces, without allowing abrupt jumps from one side to the other.
+        """
+        names = list(self.node_labels.keys())
+        base_scale = max(0.85, min(1.45, node_radius / 14.0))
+
+        # 1. Calculate smooth repulsion forces between nearby node labels.
+        forces: dict[str, list[float]] = {n: [0.0, 0.0] for n in names}
+
+        for i in range(len(names)):
+            n1 = names[i]
+            st1 = self.node_labels[n1]
+            ax1, ay1 = screen_positions[n1]
+            cx1 = ax1 + st1.cur_dx
+            cy1 = ay1 + st1.cur_dy
+
+            # Smoothly repel nearby nodes and their labels.
+            for j in range(i + 1, len(names)):
+                n2 = names[j]
+                st2 = self.node_labels[n2]
+                ax2, ay2 = screen_positions[n2]
+
+                # Ignore nodes that are far apart on screen.
+                if abs(ax1 - ax2) > 220 or abs(ay1 - ay2) > 140:
+                    continue
+
+                cx2 = ax2 + st2.cur_dx
+                cy2 = ay2 + st2.cur_dy
+
+                # Overlap between the two text boxes.
+                min_sep_x = (st1.width + st2.width) * 0.5 + 8.0
+                min_sep_y = (st1.height + st2.height) * 0.5 + 6.0
+                dx = cx1 - cx2
+                dy = cy1 - cy2
+
+                if abs(dx) < min_sep_x and abs(dy) < min_sep_y:
+                    pen_x = (min_sep_x - abs(dx)) / min_sep_x
+                    pen_y = (min_sep_y - abs(dy)) / min_sep_y
+                    strength = pen_x * pen_y * 28.0
+                    dir_x = 1.0 if dx >= 0 else -1.0
+                    dir_y = 1.0 if dy >= 0 else -1.0
+                    forces[n1][0] += dir_x * strength * 0.45
+                    forces[n1][1] += dir_y * strength * 0.85
+                    forces[n2][0] -= dir_x * strength * 0.45
+                    forces[n2][1] -= dir_y * strength * 0.85
+
+        # 2. Integrate with exponential damping toward (rest + force).
+        for name in names:
+            st = self.node_labels[name]
+            fx, fy = forces[name]
+            # Limit displacement so labels never drift too far from their hubs.
+            fx = clamp(fx, -36.0, 36.0)
+            fy = clamp(fy, -28.0, 28.0)
+
+            target_dx = st.rest_dx * base_scale + fx
+            target_dy = st.rest_dy * base_scale + fy
+
+            st.cur_dx = exp_decay(st.cur_dx, target_dx, speed=7.5, dt=dt)
+            st.cur_dy = exp_decay(st.cur_dy, target_dy, speed=7.5, dt=dt)
+
+    def update_drone_labels(
+        self,
+        active_drones: list[tuple[str, float, float]],
+        node_screen_pos: dict[str, tuple[int, int]],
+        drone_radius: int,
+        dt: float,
+    ) -> None:
+        """
+        Update drone label positions organically so labels separate smoothly
+        when drones travel together.
+        """
+        rest_y = -(drone_radius + 15.0)
+        n = len(active_drones)
+
+        for idx, (did, _, _) in enumerate(active_drones):
+            if did not in self.drone_labels:
+                # Create a small initial fan based on the drone index.
+                fan_x = ((idx % 3) - 1) * 4.0
+                self.drone_labels[did] = SmoothLabelState(
+                    rest_dx=fan_x,
+                    rest_dy=rest_y,
+                    cur_dx=fan_x,
+                    cur_dy=rest_y,
+                )
+            else:
+                self.drone_labels[did].rest_dy = rest_y
+
+        forces: dict[str, list[float]] = {
+            did: [0.0, 0.0] for did, _, _ in active_drones
+        }
+
+        # Smoothly repel labels of nearby active drones.
+        for i in range(n):
+            d1, x1, y1 = active_drones[i]
+            st1 = self.drone_labels[d1]
+            lx1, ly1 = x1 + st1.cur_dx, y1 + st1.cur_dy
+
+            for j in range(i + 1, n):
+                d2, x2, y2 = active_drones[j]
+                if abs(x1 - x2) > 130 or abs(y1 - y2) > 90:
+                    continue
+                st2 = self.drone_labels[d2]
+                lx2, ly2 = x2 + st2.cur_dx, y2 + st2.cur_dy
+
+                sep_x = (st1.width + st2.width) * 0.5 + 6.0
+                sep_y = (st1.height + st2.height) * 0.5 + 5.0
+                dx = lx1 - lx2
+                dy = ly1 - ly2
+
+                if abs(dx) < sep_x and abs(dy) < sep_y:
+                    # Break exact-position ties deterministically using the ID.
+                    if abs(dx) < 0.5 and abs(dy) < 0.5:
+                        angle = (i - j) * 1.1
+                        dx, dy = math.cos(angle), math.sin(angle)
+                    overlap_x = (sep_x - abs(dx)) / sep_x
+                    overlap_y = (sep_y - abs(dy)) / sep_y
+                    push = overlap_x * overlap_y * 24.0
+                    sx = 1.0 if dx >= 0 else -1.0
+                    sy = 1.0 if dy >= 0 else -1.0
+                    forces[d1][0] += sx * push * 0.7
+                    forces[d1][1] += sy * push * 0.7
+                    forces[d2][0] -= sx * push * 0.7
+                    forces[d2][1] -= sy * push * 0.7
+
+            # Smoothly repel nearby visible node labels.
+            for hname, (hx, hy) in node_screen_pos.items():
+                if abs(lx1 - hx) > 140 or abs(ly1 - hy) > 90:
+                    continue
+                nst = self.node_labels.get(hname)
+                if nst is None:
+                    continue
+                nlx, nly = hx + nst.cur_dx, hy + nst.cur_dy
+                sep_x = (st1.width + nst.width) * 0.5 + 6.0
+                sep_y = (st1.height + nst.height) * 0.5 + 5.0
+                dx = lx1 - nlx
+                dy = ly1 - nly
+                if abs(dx) < sep_x and abs(dy) < sep_y:
+                    push = ((sep_y - abs(dy)) / sep_y) * 18.0
+                    sy = -1.0 if dy <= 0 else 1.0
+                    forces[d1][1] += sy * push
+
+        for did, _, _ in active_drones:
+            st = self.drone_labels[did]
+            fx = clamp(forces[did][0], -34.0, 34.0)
+            fy = clamp(forces[did][1], -30.0, 22.0)
+            target_dx = st.rest_dx + fx
+            target_dy = st.rest_dy + fy
+            st.cur_dx = exp_decay(st.cur_dx, target_dx, speed=9.0, dt=dt)
+            st.cur_dy = exp_decay(st.cur_dy, target_dy, speed=9.0, dt=dt)
+
+
+class SmoothCamera2D:
+    """2D camera with exponential interpolation for smooth zooming and panning."""
+
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self.zoom = 90.0
+
+        self.target_offset_x = 0.0
+        self.target_offset_y = 0.0
+        self.target_zoom = 90.0
+
+    def fit_graph(self, graph: Graph, instant: bool = False) -> None:
+        if not graph.nodes_dict:
+            return
+        xs = [n.x for n in graph.nodes_dict.values()]
+        ys = [n.y for n in graph.nodes_dict.values()]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        span_x = max(1.0, float(max_x - min_x))
+        span_y = max(1.0, float(max_y - min_y))
+
+        margin_x = 160
+        margin_y = 145
+        usable_w = max(240, self.width - 2 * margin_x)
+        usable_h = max(220, self.height - 2 * margin_y)
+
+        z = min(usable_w / span_x, usable_h / span_y)
+        z = clamp(z, 18.0, 175.0)
+
+        cx = (min_x + max_x) * 0.5
+        cy = (min_y + max_y) * 0.5
+
+        self.target_zoom = z
+        self.target_offset_x = (self.width * 0.5) - cx * z
+        self.target_offset_y = (self.height * 0.5) + cy * z
+
+        if instant:
+            self.zoom = self.target_zoom
+            self.offset_x = self.target_offset_x
+            self.offset_y = self.target_offset_y
+
+    def update(self, dt: float) -> None:
+        self.zoom = exp_decay(self.zoom, self.target_zoom, 12.0, dt)
+        self.offset_x = exp_decay(self.offset_x, self.target_offset_x, 12.0, dt)
+        self.offset_y = exp_decay(self.offset_y, self.target_offset_y, 12.0, dt)
+
+    def pan(self, dx: float, dy: float) -> None:
+        self.target_offset_x += dx
+        self.target_offset_y += dy
+        self.offset_x += dx
+        self.offset_y += dy
+
+    def zoom_at(self, mouse_pos: tuple[int, int], factor: float) -> None:
+        mx, my = mouse_pos
+        wx = (mx - self.target_offset_x) / self.target_zoom
+        wy = (self.target_offset_y - my) / self.target_zoom
+
+        new_z = clamp(self.target_zoom * factor, 10.0, 380.0)
+        self.target_zoom = new_z
+        self.target_offset_x = mx - wx * new_z
+        self.target_offset_y = my + wy * new_z
+
+    def to_screen(self, x: float, y: float) -> tuple[int, int]:
+        return int(round(self.offset_x + x * self.zoom)), int(
+            round(self.offset_y - y * self.zoom)
+        )
+
+    def to_screen_float(self, x: float, y: float) -> tuple[float, float]:
+        return self.offset_x + x * self.zoom, self.offset_y - y * self.zoom
+
+
+@dataclass
+class DroneRenderState:
+    drone_id: str
+    wx: float
+    wy: float
+    sx: float
+    sy: float
+    heading_rad: float
+    group_key: str
+    status_text: str
+    is_active: bool
+    in_restricted: bool
+
+==> Tests/test_0.py <==
+from pathlib import Path
+
+from Backend.Parser.map_parser import MapParser
+
+
+def test_map_parser_loads_a_valid_map(tmp_path: Path) -> None:
+    map_file = tmp_path / "map.txt"
+    map_file.write_text(
+        "\n".join(
+            (
+                "nb_drones: 1",
+                "start_hub: start 0 0",
+                "end_hub: goal 2 0",
+                "connection: start-goal",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    parsed_map = MapParser(file_name=str(map_file))
+
+    assert parsed_map.nb_drones == 1
+    assert [hub.name for hub in parsed_map.hubs] == ["start", "goal"]
+    assert len(parsed_map.connections) == 1
