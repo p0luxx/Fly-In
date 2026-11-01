@@ -21,10 +21,10 @@ class Orchestrator:
         self._print_results(graph, solver, drones)
 
         if use_gui:
-            from Frontend.visualizer import FlyInVisualizer
+            from Frontend.renderer import Renderer
 
             print("\nInitializing visualizer...")
-            FlyInVisualizer(graph=graph, solver=solver).run()
+            Renderer(graph=graph, solver=solver).run()
 
     @staticmethod
     def _build_graph(content: MapParser) -> Graph:
