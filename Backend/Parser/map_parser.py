@@ -42,6 +42,10 @@ class MapParser(BaseModel):
             raise FileNotFoundError(
                 f"Map file not found: {self.file_name}"
             ) from error
+        except IsADirectoryError as error:
+            raise IsADirectoryError(
+                f"Expected a map file, but a directory was provided: {error}"
+            ) from error
 
         self.content = [
             line.strip()

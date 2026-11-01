@@ -18,12 +18,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Run route planning without opening the Pygame visualizer.",
     )
     args = parser.parse_args(argv)
-
     try:
         from Backend.orchestrator import Orchestrator
 
         Orchestrator().run(args.map_file, use_gui=not args.no_gui)
-    except (ValueError, FileNotFoundError, PermissionError, RuntimeError) as error:
+    except (ValueError, FileNotFoundError, PermissionError, RuntimeError, IsADirectoryError) as error:
         print(error, file=sys.stderr)
         return 1
     return 0

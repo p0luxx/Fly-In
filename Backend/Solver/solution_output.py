@@ -59,3 +59,26 @@ class _SolutionOutput:
                 f"Turn {idx}: {line}" for idx, line in enumerate(lines, start=1)
             )
         return "\n".join(lines)
+
+    '''
+    def test(self) -> str:
+        """Return turn-by-turn zone and connection capacity usage."""
+        out: list[str] = ["\n=== Capacity Usage Info ==="]
+        for t in range(1, self.total_turns + 1):
+            items: list[str] = []
+            for name, hub in self.graph.nodes_dict.items():
+                used = self.hub_reservations[name][t]
+                if used > 0:
+                    items.append(f"Zone {name}: {used}/{hub.max_drones} drones")
+            for link in self.graph.link_dict.values():
+                cid = self._canonical_link_id(link)
+                used = self.link_reservations[cid][t]
+                if used > 0:
+                    items.append(
+                        f"Connection {link.id}: "
+                        f"{used}/{link.max_link_capacity} capacity used"
+                    )
+            if items:
+                out.append(f"Turn {t}: {', '.join(items)}")
+        return "\n".join(out)
+    '''
