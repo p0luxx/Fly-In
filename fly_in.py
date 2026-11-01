@@ -22,7 +22,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         from Backend.orchestrator import Orchestrator
 
         Orchestrator().run(args.map_file, use_gui=not args.no_gui)
-    except (ValueError, FileNotFoundError, PermissionError, RuntimeError, IsADirectoryError) as error:
+    except (ValueError, FileNotFoundError,
+            PermissionError, RuntimeError,
+            IsADirectoryError) as error:
         print(error, file=sys.stderr)
         return 1
     return 0
