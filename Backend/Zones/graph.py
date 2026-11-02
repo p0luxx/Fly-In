@@ -11,14 +11,6 @@ class Graph:
         self.nodes_dict: dict[str, Hub] = {}
         self.adj: dict[str, list[Connection]] = {}
 
-    def test(self):
-        print("Link dict:")
-        for item in self.link_dict.items():
-            print(item)
-        print("Nodes dict")
-        for item in self.nodes_dict.items():
-            print(item)
-
     def add_node(self, node: Hub) -> None:
         if node.name in self.nodes_dict:
             raise ValueError(f"The node '{node.name}' is duplicated in the map.")

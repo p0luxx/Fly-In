@@ -1,31 +1,43 @@
-# Variables de entorno para facilitar la lectura y el mantenimiento
+# Environment variables for easier maintenance and readability
 PYTHON := python3
 VENV := venv
 VENV_BIN := $(VENV)/bin
 
-# .PHONY indica que estas reglas no son archivos físicos, sino comandos a ejecutar
-.PHONY: all install lint clean
+# Default map for 'run' and 'debug' rules
+# You can override this by running: make run MAP=maps/hard/01_maze_nightmare.txt
+MAP ?= maps/easy/01_linear_path.txt
 
-# Regla por defecto si solo ejecutas 'make'
+# .PHONY indicates these rules are not physical files, but commands to execute
+.PHONY: all install run debug lint clean
+
+# Default rule when just running 'make'
 all: install
 
-# Regla para crear el entorno virtual y actualizar pip
+# Rule to create the virtual environment and upgrade pip
 $(VENV):
 	$(PYTHON) -m venv $(VENV)
 	$(VENV_BIN)/python -m pip install --upgrade pip
 
-# Regla 'install': Depende de que $(VENV) exista. Instala las librerías.
+# 'install' rule: Depends on $(VENV) existing. Installs required libraries.
 install: $(VENV)
 	$(VENV_BIN)/pip install pydantic flake8 mypy pygame pytest
 
-# Regla 'lint': Valida el código usando los ejecutables dentro del entorno virtual
-lint:
-	@echo "Ejecutando Flake8 (Estilo)..."
-	$(VENV_BIN)/flake8 .
-	@echo "Ejecutando MyPy (Tipado Estático)..."
-	$(VENV_BIN)/mypy .
+# 'run' rule: Executes the main application script.
+run: $(VENV)
+	$(VENV_BIN)/python fly_in.py $(MAP)
 
-# Regla 'clean': Elimina el entorno virtual y los archivos temporales de caché
+# 'debug' rule: Starts the script in debug mode using pdb.
+debug: $(VENV)
+	$(VENV_BIN)/python -m pdb fly_in.py $(MAP)
+
+# 'lint' rule: Runs the strictly required static analysis commands
+lint: $(VENV)
+	@echo "Running Flake8 (Style)..."
+	$(VENV_BIN)/flake8 .
+	@echo "Running MyPy (Static Typing)..."
+	$(VENV_BIN)/mypy . --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs
+
+# 'clean' rule: Removes the virtual environment and temporary cache files
 clean:
 	rm -rf $(VENV)
 	rm -rf .mypy_cache

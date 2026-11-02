@@ -18,7 +18,7 @@ class Orchestrator:
         graph = self._build_graph(content)
         solver = Solver(graph)
         drones = solver.solve()
-        self._print_results(graph, solver, drones)
+        self._print_results(graph, solver, drones, use_gui)
 
         if use_gui:
             from Frontend.renderer import Renderer
@@ -37,7 +37,9 @@ class Orchestrator:
         return graph
 
     @staticmethod
-    def _print_results(graph: Graph, solver: Solver, drones: list[Drone]) -> None:
+    def _print_results(
+        graph: Graph, solver: Solver, drones: list[Drone], use_gui: bool
+    ) -> None:
         start_name = graph.start.name if graph.start else "start"
         end_name = graph.end.name if graph.end else "goal"
 
@@ -52,12 +54,15 @@ class Orchestrator:
             print(f"{drone.id}: {route} (arrives on turn {arrival_turn})")
 
         print("\n=== Turn-by-turn simulation ===")
-        simulation_output = solver.format_solution(show_turn_prefix=True)
-        print(
-            simulation_output
-            if simulation_output
-            else "No moves are required."
-        )
+        if not use_gui:
+            simulation_output = solver.format_solution(show_turn_prefix=True)
+            print(
+                simulation_output
+                if simulation_output
+                else "No moves are required."
+            )
+        else:
+            print("(Advance in the visualizer with RIGHT arrow to print turns...)")
 
         print("\n=== Summary ===")
         print(

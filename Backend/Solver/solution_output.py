@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-
 from Backend.Drones.drone import Drone
 from Backend.Zones.graph import Graph
 
@@ -16,6 +15,8 @@ class _SolutionOutput:
     graph: Graph
     total_turns: int
 
+    hub_reservations: dict[str, dict[int, int]]
+    link_reservations: dict[str, dict[int, int]]
     def solve(
         self,
         include_waits_in_path: bool = False,
@@ -60,25 +61,17 @@ class _SolutionOutput:
             )
         return "\n".join(lines)
 
-    '''
-    def test(self) -> str:
-        """Return turn-by-turn zone and connection capacity usage."""
-        out: list[str] = ["\n=== Capacity Usage Info ==="]
-        for t in range(1, self.total_turns + 1):
-            items: list[str] = []
-            for name, hub in self.graph.nodes_dict.items():
-                used = self.hub_reservations[name][t]
-                if used > 0:
-                    items.append(f"Zone {name}: {used}/{hub.max_drones} drones")
-            for link in self.graph.link_dict.values():
-                cid = self._canonical_link_id(link)
-                used = self.link_reservations[cid][t]
-                if used > 0:
-                    items.append(
-                        f"Connection {link.id}: "
-                        f"{used}/{link.max_link_capacity} capacity used"
-                    )
-            if items:
-                out.append(f"Turn {t}: {', '.join(items)}")
-        return "\n".join(out)
-    '''
+    def test(self, turn: int) -> str:
+        out: list[str] = []
+        for name, node in self.graph.nodes_dict.items():
+            used = self.hub_reservations[name][turn]
+            if used:
+                out.append(f"Node name: {name} Capacity={used}/{node.max_drones}")
+        for link in self.graph.link_dict.values():
+            cot = self._canonical_link_id(link)
+            used = self.link_reservations[cot][turn]
+            if used:
+                out.append(f"Connection:  {cot} -> {used}/{link.max_link_capacity} capacity used")
+        if out:
+            return f", ".join(out)
+        return ""

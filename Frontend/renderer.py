@@ -39,9 +39,18 @@ class Renderer:
         self.fullscreen = False
         self.show_names = True
         self.win_size = (1200, 800)
-
         self.steps_by_drone: dict[str, dict[int, ScheduledStep]] = {}
         self.last_turn: dict[str, int] = {}
+        self.max_printed_turn = 0
+        self.turn_moves: dict[int, list[str]] = {}
+        for drone_id, steps in solver.schedules.items():
+            for step in steps:
+                if not step.is_wait:
+                    dst = (f"{step.from_zone}-{step.to_zone}"
+                           if step.is_restricted_transit else step.to_zone)
+                    self.turn_moves.setdefault(step.turn, []).append(
+                        f"{drone_id}-{dst}"
+                        )
         for drone in solver.drones:
             sched = solver.schedules.get(drone.id, [])
             self.steps_by_drone[drone.id] = {s.turn: s for s in sched}
@@ -266,6 +275,15 @@ class Renderer:
                         running = False
                     elif event.key == pygame.K_RIGHT:
                         self.turn = min(self.solver.total_turns, self.turn + 1)
+                        if self.turn > self.max_printed_turn:
+                                self.max_printed_turn = self.turn
+                                if self.turn in self.turn_moves:
+                                    moves_str = " ".join(self.turn_moves[self.turn])
+                                    print(f"Turn {self.turn}: {moves_str}")
+                            #-------------------
+                                    print(self.solver.test(self.turn))
+                        else:
+                            print("All nodes have reached the goal...")
                     elif event.key == pygame.K_LEFT:
                         self.turn = max(0, self.turn - 1)
                     elif event.key == pygame.K_n:
