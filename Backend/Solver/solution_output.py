@@ -60,18 +60,3 @@ class _SolutionOutput:
                 f"Turn {idx}: {line}" for idx, line in enumerate(lines, start=1)
             )
         return "\n".join(lines)
-
-    def test(self, turn: int) -> str:
-        out: list[str] = []
-        for name, node in self.graph.nodes_dict.items():
-            used = self.hub_reservations[name][turn]
-            if used:
-                out.append(f"Node name: {name} Capacity={used}/{node.max_drones}")
-        for link in self.graph.link_dict.values():
-            cot = self._canonical_link_id(link)
-            used = self.link_reservations[cot][turn]
-            if used:
-                out.append(f"Connection:  {cot} -> {used}/{link.max_link_capacity} capacity used")
-        if out:
-            return f", ".join(out)
-        return ""

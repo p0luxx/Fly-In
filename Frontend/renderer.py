@@ -280,8 +280,6 @@ class Renderer:
                                 if self.turn in self.turn_moves:
                                     moves_str = " ".join(self.turn_moves[self.turn])
                                     print(f"Turn {self.turn}: {moves_str}")
-                            #-------------------
-                                    print(self.solver.test(self.turn))
                         else:
                             print("All nodes have reached the goal...")
                     elif event.key == pygame.K_LEFT:
