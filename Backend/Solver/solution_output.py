@@ -17,6 +17,7 @@ class _SolutionOutput:
 
     hub_reservations: dict[str, dict[int, int]]
     link_reservations: dict[str, dict[int, int]]
+
     def solve(
         self,
         include_waits_in_path: bool = False,

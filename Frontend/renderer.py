@@ -30,7 +30,7 @@ COLORS: dict[str, tuple[int, int, int]] = {
 
 
 class Renderer:
-    """Minimalist turn-based visualizer that scales dynamically with the screen."""
+    """Minimalist turn-based visualizer that scales dynamically."""
 
     def __init__(self, graph: Graph, solver: Solver) -> None:
         self.graph = graph
@@ -46,11 +46,14 @@ class Renderer:
         for drone_id, steps in solver.schedules.items():
             for step in steps:
                 if not step.is_wait:
-                    dst = (f"{step.from_zone}-{step.to_zone}"
-                           if step.is_restricted_transit else step.to_zone)
+                    dst = (
+                        f"{step.from_zone}-{step.to_zone}"
+                        if step.is_restricted_transit
+                        else step.to_zone
+                    )
                     self.turn_moves.setdefault(step.turn, []).append(
                         f"{drone_id}-{dst}"
-                        )
+                    )
         for drone in solver.drones:
             sched = solver.schedules.get(drone.id, [])
             self.steps_by_drone[drone.id] = {s.turn: s for s in sched}
@@ -59,7 +62,7 @@ class Renderer:
     def _to_screen(
         self, x: float, y: float, width: int, height: int
     ) -> tuple[int, int]:
-        """Map world coordinates (x, y) to screen pixels with aspect-ratio scaling."""
+        """Map world coordinates (x, y) to screen pixels."""
         if not self.graph.nodes_dict:
             return width // 2, height // 2
 
@@ -85,7 +88,7 @@ class Renderer:
         return sx, sy
 
     def _drone_world_pos(self, drone_id: str) -> tuple[float, float]:
-        """Return world coordinates (wx, wy) of a drone on the current turn."""
+        """Return world coordinates (wx, wy) of a drone on current turn."""
         start = self.graph.start
         end = self.graph.end
         if start is None or end is None:
@@ -147,8 +150,14 @@ class Renderer:
                 overlap = 0
                 for occ in occupied:
                     if cand.colliderect(occ):
-                        ix = min(cand.right, occ.right) - max(cand.left, occ.left)
-                        iy = min(cand.bottom, occ.bottom) - max(cand.top, occ.top)
+                        ix = (
+                            min(cand.right, occ.right)
+                            - max(cand.left, occ.left)
+                        )
+                        iy = (
+                            min(cand.bottom, occ.bottom)
+                            - max(cand.top, occ.top)
+                        )
                         overlap += ix * iy
 
                 if overlap == 0:
@@ -206,7 +215,8 @@ class Renderer:
             box = self._place_label(pos, label.get_size(), radius, occupied)
             occupied.append(box)
 
-            if math.hypot(box.centerx - pos[0], box.centery - pos[1]) > radius * 2.4:
+            dist = math.hypot(box.centerx - pos[0], box.centery - pos[1])
+            if dist > radius * 2.4:
                 pygame.draw.line(screen, (95, 105, 130), pos, box.center, 1)
 
             pygame.draw.rect(screen, (18, 22, 32), box, border_radius=4)
@@ -276,12 +286,12 @@ class Renderer:
                     elif event.key == pygame.K_RIGHT:
                         self.turn = min(self.solver.total_turns, self.turn + 1)
                         if self.turn > self.max_printed_turn:
-                                self.max_printed_turn = self.turn
-                                if self.turn in self.turn_moves:
-                                    moves_str = " ".join(self.turn_moves[self.turn])
-                                    print(f"Turn {self.turn}: {moves_str}")
-                        else:
-                            print("All nodes have reached the goal...")
+                            self.max_printed_turn = self.turn
+                            if self.turn in self.turn_moves:
+                                moves = " ".join(self.turn_moves[self.turn])
+                                print(f"Turn {self.turn}: {moves}")
+                            else:
+                                print("All nodes have reached the goal...")
                     elif event.key == pygame.K_LEFT:
                         self.turn = max(0, self.turn - 1)
                     elif event.key == pygame.K_n:
